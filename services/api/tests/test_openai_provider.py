@@ -31,8 +31,16 @@ class FakeResponses:
         if len(self.create_calls) == 1:
             call = SimpleNamespace(
                 type="function_call",
-                name="search_programs",
-                arguments=json.dumps({"query": "Computer Science", "country": "", "field": ""}),
+                name="discover_official_programs",
+                arguments=json.dumps({
+                    "countries": ["United States"],
+                    "fields": ["Computer Science"],
+                    "degree_level": "master",
+                    "target_university": "",
+                    "max_qs_rank": 100,
+                    "excluded_program_ids": [],
+                    "max_candidates": 5,
+                }),
                 call_id="call-test-1",
             )
             return SimpleNamespace(
@@ -62,11 +70,17 @@ class FakeResponses:
         )
 
 
-async def test_responses_function_call_loop_records_trace():
+async def test_responses_function_call_loop_records_trace(monkeypatch):
     fake = FakeResponses()
     instance = OpenAIResponsesProvider()
     instance.client = SimpleNamespace(responses=fake)
     skill = skill_registry.get("program-research")
+    async def fake_discovery(_session, _arguments):
+        return [{"id": "test-program", "university": "Test University"}]
+
+    monkeypatch.setattr(
+        tool_registry.tools["discover_official_programs"], "handler", fake_discovery
+    )
     async with SessionLocal() as session:
         run = AgentRun(
             owner_id=settings.local_owner_id,
@@ -90,7 +104,7 @@ async def test_responses_function_call_loop_records_trace():
     assert "没有从项目目录" in json.loads(output)["summary"]
     assert usage["total_tokens"] == 45
     assert len(fake.create_calls) == 2
-    assert traces[0].tool_name == "search_programs"
+    assert traces[0].tool_name == "discover_official_programs"
     assert traces[0].status == "completed"
 
 

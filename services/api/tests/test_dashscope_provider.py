@@ -26,9 +26,17 @@ class FakeDashScopeCompletions:
                         id="call-qwen-1",
                         type="function",
                         function=SimpleNamespace(
-                            name="search_programs",
+                            name="discover_official_programs",
                             arguments=json.dumps(
-                                {"query": "Computer Science", "country": "", "field": ""}
+                                {
+                                    "countries": ["United States"],
+                                    "fields": ["Computer Science"],
+                                    "degree_level": "master",
+                                    "target_university": "",
+                                    "max_qs_rank": 100,
+                                    "excluded_program_ids": [],
+                                    "max_candidates": 5,
+                                }
                             ),
                         ),
                     )
@@ -51,11 +59,17 @@ class FakeDashScopeCompletions:
         )
 
 
-async def test_dashscope_function_call_loop_records_trace():
+async def test_dashscope_function_call_loop_records_trace(monkeypatch):
     fake = FakeDashScopeCompletions()
     instance = DashScopeChatProvider()
     instance.client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
     skill = skill_registry.get("program-research")
+    async def fake_discovery(_session, _arguments):
+        return [{"id": "test-program", "university": "Test University"}]
+
+    monkeypatch.setattr(
+        tool_registry.tools["discover_official_programs"], "handler", fake_discovery
+    )
     async with SessionLocal() as session:
         run = AgentRun(
             owner_id=settings.local_owner_id,
@@ -89,7 +103,7 @@ async def test_dashscope_function_call_loop_records_trace():
     assert fake.calls[0]["tools"][0]["type"] == "function"
     assert fake.calls[0]["tools"][0]["function"]["parameters"]["type"] == "object"
     assert any(message.get("role") == "tool" for message in fake.calls[1]["messages"] if isinstance(message, dict))
-    assert traces[0].tool_name == "search_programs"
+    assert traces[0].tool_name == "discover_official_programs"
     assert traces[0].status == "completed"
 
 

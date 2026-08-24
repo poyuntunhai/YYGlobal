@@ -1,6 +1,5 @@
 tools:
-  - search_programs
-  - mcp_catalog_search
+  - discover_official_programs
   - fetch_official_source
   - extract_program_requirements
   - verify_program_official

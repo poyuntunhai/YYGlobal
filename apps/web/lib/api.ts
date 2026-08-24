@@ -32,6 +32,28 @@ export type Profile = {
   updated_at: string;
 };
 
+export type RecommendationGoal = {
+  id: string;
+  owner_id: string;
+  target_countries: string[];
+  target_fields: string[];
+  target_university: string;
+  target_degree_level: "undergraduate" | "master" | "doctoral";
+  intake: string;
+  budget: number | null;
+  max_qs_rank: number | null;
+  updated_at: string;
+};
+
+export type UniversityOption = {
+  university: string;
+  country: string;
+  city: string;
+  qs_rank: number;
+};
+
+export type RecommendationGoalInput = Omit<RecommendationGoal, "id" | "owner_id" | "updated_at">;
+
 export type ParsedDocument = {
   id: string;
   filename: string;
@@ -66,7 +88,11 @@ export type Program = {
   duration_months: number | null;
   tuition: number | null;
   currency: string;
+  qs_rank: number | null;
+  qs_ranking_year: number | null;
   official_url: string;
+  catalog_url: string;
+  faculty_catalog_url: string;
   summary: string;
   requirement: Requirement | null;
   sources: { id: string; url: string; title: string; status: string; fetched_at: string }[];
@@ -77,6 +103,8 @@ export type ProgramRecommendation = {
   program: Program;
   score: number;
   reasons: string[];
+  verification_status: "verified" | "needs_review" | "failed";
+  verification_error: string;
 };
 
 export type Shortlist = {
@@ -265,6 +293,9 @@ export const api = {
   profile: () => request<Profile>("/profile"),
   saveProfile: (profile: Omit<Profile, "id" | "owner_id" | "updated_at">) =>
     request<Profile>("/profile", { method: "PUT", body: JSON.stringify(profile) }),
+  recommendationGoal: () => request<RecommendationGoal>("/recommendation-goal"),
+  saveRecommendationGoal: (goal: RecommendationGoalInput) =>
+    request<RecommendationGoal>("/recommendation-goal", { method: "PUT", body: JSON.stringify(goal) }),
   profileExportUrl: `${API_URL}/profile/export`,
   deleteProfile: async () => {
     const response = await fetch(`${API_URL}/profile?confirm=DELETE_MY_P0_DATA`, { method: "DELETE" });
@@ -288,6 +319,12 @@ export const api = {
     method: "POST", body: JSON.stringify({ accepted_fields: acceptedFields }),
   }),
   programs: (query = "", personalized = true) => request<Program[]>(`/programs?q=${encodeURIComponent(query)}&personalized=${personalized}`),
+  universityOptions: (countries: string[] = [], maxQsRank: number | null = 100) => {
+    const params = new URLSearchParams();
+    countries.forEach((country) => params.append("countries", country));
+    if (maxQsRank !== null) params.set("max_qs_rank", String(maxQsRank));
+    return request<UniversityOption[]>(`/programs/universities?${params.toString()}`);
+  },
   program: (id: string) => request<Program>(`/programs/${id}`),
   programRecommendations: (query = "", excludeIds: string[] = []) => request<ProgramRecommendation[]>(
     `/programs/recommendations?q=${encodeURIComponent(query)}&limit=5&exclude_ids=${encodeURIComponent(excludeIds.join(","))}`,
@@ -347,6 +384,7 @@ export const api = {
   updateWritingConversation: (id: string, values: { title?: string; resource_ids?: string[] }) => request<WritingConversation>(`/writing-conversations/${id}`, { method: "PATCH", body: JSON.stringify(values) }),
   sendWritingMessage: (id: string, message: string, signal?: AbortSignal) => request<WritingConversation>(`/writing-conversations/${id}/messages`, { method: "POST", body: JSON.stringify({ message }), signal }),
   cancelWritingGeneration: (id: string) => request<{ cancelled: boolean }>(`/writing-conversations/${id}/cancel`, { method: "POST" }),
+  cancelChatGeneration: (id: string) => request<{ cancelled: boolean }>(`/chat/${id}/cancel`, { method: "POST" }),
   applicationPackages: () => request<ApplicationPackage[]>("/application-packages"),
   refreshApplicationPackage: (programId: string) =>
     request<ApplicationPackage>(`/application-packages/${programId}/refresh`, { method: "POST" }),

@@ -78,7 +78,6 @@ export default function ProfilePage() {
   });
 
   function update<K extends keyof typeof form>(key: K, value: (typeof form)[K]) { setForm((current) => ({ ...current, [key]: value })); }
-  function listValue(value: string) { return value.split(/[,，]/).map((item) => item.trim()).filter(Boolean); }
   function changeExperience(index: number, key: keyof Experience, value: string | boolean | string[]) {
     setForm((current) => ({ ...current, experiences: current.experiences.map((item, itemIndex) => itemIndex === index ? { ...item, [key]: value } : item) }));
   }
@@ -109,15 +108,6 @@ export default function ProfilePage() {
               <label><span className="label">GPA 满分</span><input className="field" type="number" step="0.1" value={form.gpa_scale ?? ""} onChange={(event) => update("gpa_scale", event.target.value ? Number(event.target.value) : null)} /></label>
               <label><span className="label">TOEFL</span><input className="field" type="number" value={form.language_scores.TOEFL ?? ""} onChange={(event) => update("language_scores", { ...form.language_scores, TOEFL: Number(event.target.value) })} /></label>
               <label><span className="label">IELTS</span><input className="field" type="number" step="0.5" value={form.language_scores.IELTS ?? ""} onChange={(event) => update("language_scores", { ...form.language_scores, IELTS: Number(event.target.value) })} /></label>
-            </div>
-          </Card>
-          <Card>
-            <p className="eyebrow">Application goal</p><h2 className="mt-2 text-xl font-black">申请目标</h2>
-            <div className="mt-5 grid gap-4 sm:grid-cols-2">
-              <label><span className="label">目标国家（逗号分隔）</span><input className="field" value={form.target_countries.join(", ")} onChange={(event) => update("target_countries", listValue(event.target.value))} /></label>
-              <label><span className="label">目标方向（逗号分隔）</span><input className="field" value={form.target_fields.join(", ")} onChange={(event) => update("target_fields", listValue(event.target.value))} /></label>
-              <label><span className="label">入学时间</span><input className="field" placeholder="2027 Fall" value={form.intake} onChange={(event) => update("intake", event.target.value)} /></label>
-              <label><span className="label">总预算（USD）</span><input className="field" type="number" value={form.budget ?? ""} onChange={(event) => update("budget", event.target.value ? Number(event.target.value) : null)} /></label>
             </div>
           </Card>
           <Card>

@@ -576,7 +576,10 @@ export function ApplicationPackages() {
               onClick={() => confirmPlan.mutate()}
               disabled={
                 confirmPlan.isPending ||
-                pack.checklist.some((row) => !row.selected_asset_id)
+                !pack.checklist.length ||
+                pack.checklist.some(
+                  (row) => row.status !== "ready" || !row.selected_asset_id,
+                )
               }
             >
               <Check size={15} />
@@ -613,11 +616,15 @@ export function ApplicationPackages() {
               </button>
             </div>
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-5 py-4 [scrollbar-gutter:stable]">
-              {historyRow.candidate_assets.map((asset) => (
-                <div
+              {historyRow.candidate_assets.map((asset) => {
+                const unavailable =
+                  (asset.type === "draft" && asset.status !== "reviewed") ||
+                  (asset.type === "artifact" && !["ready", "submitted"].includes(asset.status ?? ""));
+                return <div
                   key={`${asset.type}:${asset.id}`}
                   className={cn(
                     "flex items-center gap-2 rounded-xl border p-2",
+                    unavailable && "opacity-55",
                     historyAsset === `${asset.type}:${asset.id}`
                       ? "border-moss bg-mint/45"
                       : "border-black/5",
@@ -625,6 +632,7 @@ export function ApplicationPackages() {
                 >
                   <button
                     type="button"
+                    disabled={unavailable}
                     onClick={() => setHistoryAsset(`${asset.type}:${asset.id}`)}
                     className="flex min-w-0 flex-1 items-center gap-3 p-1 text-left"
                   >
@@ -646,7 +654,7 @@ export function ApplicationPackages() {
                       <span className="text-xs text-ink/40">
                         {asset.type === "draft" ? "AI 文稿" : asset.type}
                         {asset.scope === "other_program" ? " · 其他项目版本" : ""}
-                        {asset.status === "draft" ? " · 未确认草稿" : ""}
+                        {asset.status === "draft" ? " · 未确认，暂不可采用" : ""}
                       </span>
                     </span>
                   </button>
@@ -664,8 +672,8 @@ export function ApplicationPackages() {
                     <Eye size={14} />
                     预览
                   </Button>
-                </div>
-              ))}
+                </div>;
+              })}
               {!historyRow.candidate_assets.length && (
               <p className="rounded-xl bg-amber-50 p-4 text-sm text-amber-800">
                 资源库中还没有可用历史版本，请使用 AI 助手生成。

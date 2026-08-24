@@ -61,6 +61,19 @@ class ApplicantProfile(Base, TimestampMixin, OwnedMixin):
     confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class RecommendationGoal(Base, TimestampMixin, OwnedMixin):
+    __tablename__ = "recommendation_goals"
+    __table_args__ = (UniqueConstraint("owner_id", name="uq_recommendation_goals_owner"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    target_countries: Mapped[list] = mapped_column(JSON, default=list)
+    target_fields: Mapped[list] = mapped_column(JSON, default=list)
+    target_university: Mapped[str] = mapped_column(String(200), default="")
+    target_degree_level: Mapped[str] = mapped_column(String(30), default="master")
+    intake: Mapped[str] = mapped_column(String(80), default="")
+    budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_qs_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=100)
+
+
 class Experience(Base, TimestampMixin, OwnedMixin):
     __tablename__ = "experiences"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -100,7 +113,11 @@ class Program(Base, TimestampMixin):
     duration_months: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     tuition: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     currency: Mapped[str] = mapped_column(String(8), default="USD")
+    qs_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    qs_ranking_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     official_url: Mapped[str] = mapped_column(String(500))
+    catalog_url: Mapped[str] = mapped_column(String(500), default="")
+    faculty_catalog_url: Mapped[str] = mapped_column(String(500), default="")
     summary: Mapped[str] = mapped_column(Text, default="")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -213,7 +230,38 @@ class MaterialDraft(Base, TimestampMixin, OwnedMixin):
     source_experience_ids: Mapped[list] = mapped_column(JSON, default=list)
     warnings: Mapped[list] = mapped_column(JSON, default=list)
     model_info: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    context_manifest_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("context_manifests.id"), nullable=True, index=True
+    )
+    source_refs: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(30), default="draft", index=True)
+
+
+class ContextManifest(Base, TimestampMixin, OwnedMixin):
+    __tablename__ = "context_manifests"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    agent_run_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("agent_runs.id"), nullable=True, index=True
+    )
+    conversation_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("conversations.id"), nullable=True, index=True
+    )
+    program_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("programs.id"), nullable=True, index=True
+    )
+    material_kind: Mapped[str] = mapped_column(String(40), default="", index=True)
+    slot_key: Mapped[str] = mapped_column(String(120), default="", index=True)
+    intent: Mapped[str] = mapped_column(String(30), default="chat", index=True)
+    profile_ref: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    conversation_ref: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    experience_refs: Mapped[list] = mapped_column(JSON, default=list)
+    document_refs: Mapped[list] = mapped_column(JSON, default=list)
+    draft_refs: Mapped[list] = mapped_column(JSON, default=list)
+    official_evidence_refs: Mapped[list] = mapped_column(JSON, default=list)
+    current_draft_ref: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    content_hashes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    completeness: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
 
 
 class ApplicationPackage(Base, TimestampMixin, OwnedMixin):
@@ -267,6 +315,7 @@ class Conversation(Base, TimestampMixin, OwnedMixin):
     slot_key: Mapped[str] = mapped_column(String(120), default="", index=True)
     material_kind: Mapped[str] = mapped_column(String(40), default="", index=True)
     resource_ids: Mapped[list] = mapped_column(JSON, default=list)
+    memory_state: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 

@@ -248,7 +248,12 @@ export default function AssistantPage() {
   function stopGeneration() {
     const conversationId = activeGenerationConversationId.current;
     generationAbort.current?.abort();
-    if (conversationId) void api.cancelWritingGeneration(conversationId).catch(() => undefined);
+    if (conversationId) {
+      const cancel = materialMode
+        ? api.cancelWritingGeneration(conversationId)
+        : api.cancelChatGeneration(conversationId);
+      void cancel.catch(() => undefined);
+    }
     setRunning(false);
     setNotice("正在停止本次生成…");
   }
@@ -271,16 +276,17 @@ export default function AssistantPage() {
     const controller = new AbortController();
     generationAbort.current = controller;
     let conversationId = globalSelected?.id;
+    if (conversationId) activeGenerationConversationId.current = conversationId;
     try {
       await streamAgent(value, ({ event: name, data }) => {
-        if (name === "run.started") { conversationId = String(data.conversation_id); setSelectedId(conversationId); replaceLocation({ conversation: conversationId }); }
+        if (name === "run.started") { conversationId = String(data.conversation_id); activeGenerationConversationId.current = conversationId; setSelectedId(conversationId); replaceLocation({ conversation: conversationId }); }
         if (name === "message.completed") setLocalMessages((rows) => [...rows, { role: "assistant", content: String(data.content) }]);
       }, conversationId, controller.signal);
       client.invalidateQueries({ queryKey: ["assistant-conversations"] });
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) setLocalMessages((rows) => [...rows, { role: "assistant", content: error instanceof Error ? error.message : "AI 助手请求失败" }]);
-      else setNotice("已停止本次生成。");
-    } finally { if (generationAbort.current === controller) generationAbort.current = null; setRunning(false); }
+      else { setInput(value); setNotice("已停止本次生成，消息已放回输入框。"); }
+    } finally { if (generationAbort.current === controller) generationAbort.current = null; activeGenerationConversationId.current = ""; setRunning(false); }
   }
 
   const resourceOptions = useMemo<Array<{ id: string; label: string; meta: string; locked?: boolean }>>(() => [

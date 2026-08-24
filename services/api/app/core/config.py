@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     mcp_config_file: Path = Path("./config/mcp_servers.json")
     official_fetch_timeout_seconds: int = 20
     official_fetch_user_agent: str = "YYGlobalBot/0.1 (+educational prototype)"
+    program_discovery_model: str = ""
+    program_verification_model: str = ""
+    program_discovery_timeout_seconds: int = 90
+    # The whole discovery tool also performs directory crawling and page
+    # verification after the search-model request returns, so it must have a
+    # larger budget than the model request itself.
+    program_discovery_operation_timeout_seconds: int = 180
     cors_origins_csv: str = "http://localhost:3000"
 
     @property

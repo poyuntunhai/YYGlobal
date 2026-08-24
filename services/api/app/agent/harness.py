@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -6,11 +7,13 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.context import build_context
+from app.agent.goals import resolve_skill_and_goal
 from app.agent.guardrails import check_user_input, verify_output
 from app.agent.planner import build_plan
 from app.agent.provider import provider
-from app.agent.skills import parse_skill_output, skill_registry
+from app.agent.skills import parse_skill_output
 from app.agent.tools import tool_registry
+from app.agent.validators import audit_program_research_run, update_synthesis_steps
 from app.core.config import settings
 from app.models.entities import AgentRun, AgentStep, Conversation, Message
 
@@ -60,10 +63,11 @@ class AgentHarness:
                 sources=attachment_sources,
             )
         )
-        skill = skill_registry.route(message)
+        skill, goal_spec = await resolve_skill_and_goal(session, message)
         context = await build_context(session, skill.name, message, conversation)
-        conversation.resource_ids = []
-        plan = build_plan(skill, message)
+        context["goal_spec"] = goal_spec
+        plan = build_plan(skill, message, goal_spec)
+        context["plan"] = plan
         run = AgentRun(
             owner_id=settings.local_owner_id,
             conversation_id=conversation.id,
@@ -91,13 +95,27 @@ class AgentHarness:
                 position=position,
                 name=item["name"],
                 expected_output=item["expected_output"],
+                checkpoint={
+                    "plan_id": item["id"],
+                    "step_type": item.get("step_type", "generic"),
+                    "allowed_tools": item.get("allowed_tools", []),
+                    "acceptance_criteria": item.get("acceptance_criteria", []),
+                },
             )
             session.add(step)
             step_records.append(step)
         await session.commit()
 
         try:
-            if step_records:
+            if skill.name == "program-research" and step_records:
+                step_records[0].status = "accepted"
+                step_records[0].result = {
+                    "status": "accepted",
+                    "goal_spec": goal_spec,
+                }
+                await session.commit()
+                await emit("step.completed", {"run_id": run.id, "step": step_records[0].name})
+            elif step_records:
                 step_records[0].status = "running"
                 await session.commit()
                 await emit("step.started", {"run_id": run.id, "step": step_records[0].name})
@@ -109,8 +127,15 @@ class AgentHarness:
                 skill=skill,
                 tools=tool_registry,
                 emit=emit,
+                goal_spec=goal_spec,
             )
             structured_output = parse_skill_output(skill, final_output)
+            audit = None
+            if skill.name == "program-research":
+                structured_output, audit = await audit_program_research_run(
+                    session, run.id, structured_output, goal_spec
+                )
+                step_records = await update_synthesis_steps(session, run.id, audit)
             display_output = structured_output["summary"]
             # Guard the entire structured result. Unsafe text can otherwise hide in a
             # nested recommendation while the user-facing summary remains harmless.
@@ -122,18 +147,34 @@ class AgentHarness:
                 display_output = "模型输出未通过安全检查，请换一种方式描述任务。"
                 run.stop_reason = "output_guardrail"
             else:
-                run.stop_reason = "success"
-            for step in step_records:
-                step.status = "completed"
-                step.result = {"status": "verified", "skill": skill.name}
-                step.checkpoint = {"position": step.position, "completed": True}
-                await emit("step.completed", {"run_id": run.id, "step": step.name})
-            run.plan = [{**item, "status": "completed"} for item in (run.plan or [])]
+                run.stop_reason = (
+                    "success"
+                    if not audit or audit.get("release")
+                    else "verification_incomplete"
+                )
+            if skill.name != "program-research":
+                for step in step_records:
+                    step.status = "completed"
+                    step.result = {"status": "verified", "skill": skill.name}
+                    step.checkpoint = {"position": step.position, "completed": True}
+                    await emit("step.completed", {"run_id": run.id, "step": step.name})
+            else:
+                await session.flush()
+                for step in step_records:
+                    event = "step.completed" if step.status == "accepted" else "step.blocked"
+                    if step.status in {"accepted", "blocked", "rejected", "failed"}:
+                        await emit(event, {"run_id": run.id, "step": step.name, "status": step.status})
+            statuses = {step.position: step.status for step in step_records}
+            run.plan = [
+                {**item, "status": statuses.get(index, item.get("status", "pending"))}
+                for index, item in enumerate(run.plan or [])
+            ]
             run.status = "completed"
             run.final_output = display_output
             run.structured_output = structured_output
             run.token_usage = usage
             run.duration_ms = int((time.perf_counter() - started) * 1000)
+            conversation.resource_ids = []
             session.add(
                 Message(
                     conversation_id=conversation.id,
@@ -152,6 +193,18 @@ class AgentHarness:
                 {"run_id": run.id, "duration_ms": run.duration_ms, "usage": usage},
             )
             return run
+        except asyncio.CancelledError:
+            for step in step_records:
+                if step.status == "running":
+                    step.status = "cancelled"
+                    step.result = {"status": "cancelled"}
+            run.status = "cancelled"
+            run.stop_reason = "user_cancelled"
+            run.final_output = ""
+            run.duration_ms = int((time.perf_counter() - started) * 1000)
+            await session.commit()
+            await emit("run.cancelled", {"run_id": run.id})
+            raise
         except Exception as exc:
             for step in step_records:
                 if step.status == "running":

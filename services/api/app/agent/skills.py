@@ -149,7 +149,8 @@ def ground_skill_output(
             continue
         programs.append({
             "id": fact["id"], "university": fact["university"], "name": fact["name"],
-            "field": fact.get("field", ""), "official_url": fact["official_url"],
+            "field": fact.get("field", ""), "degree": fact.get("degree", ""),
+            "country": fact.get("country", ""), "official_url": fact["official_url"],
             "reason": "专业方向和目标国家符合当前画像筛选条件；具体门槛以官网证据为准",
         })
     allowed_urls = set(grounded_urls) | {

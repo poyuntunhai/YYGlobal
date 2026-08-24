@@ -1,12 +1,22 @@
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.agent.conversation_memory import build_conversation_memory
+from app.agent.material_context import content_hash
 from app.agent.provider import provider
-from app.models.entities import Conversation, Document, MaterialDraft, Memory, Message, Program, Task
+from app.core.config import settings
+from app.models.entities import (
+    Conversation,
+    Document,
+    MaterialDraft,
+    Memory,
+    Message,
+    Program,
+    Task,
+)
 from app.services.business import profile_with_experiences
 
 
@@ -14,7 +24,7 @@ async def build_context(
     session: AsyncSession,
     skill_name: str,
     goal: str,
-    conversation: Conversation | None = None,
+    conversation: Optional[Conversation] = None,
 ) -> Dict[str, Any]:
     profile, experiences = await profile_with_experiences(session)
     memories = list(
@@ -76,6 +86,66 @@ async def build_context(
         MaterialDraft.owner_id == settings.local_owner_id,
         MaterialDraft.id.in_(draft_ids),
     ))).all()) if draft_ids else []
+    resource_snapshots = [
+        *[
+            {
+                "resource_id": f"document:{item.id}",
+                "label": item.filename,
+                "kind": item.kind,
+                "readable": bool(
+                    (item.extracted_text or "").strip()
+                    or str((item.extracted_data or {}).get("summary") or "").strip()
+                ),
+                "content_hash": content_hash(
+                    item.extracted_text
+                    or str((item.extracted_data or {}).get("summary") or "")
+                ),
+            }
+            for item in documents
+        ],
+        *[
+            {
+                "resource_id": f"draft:{item.id}",
+                "label": item.title,
+                "kind": item.kind,
+                "readable": bool(item.content.strip()),
+                "content_hash": content_hash(item.content),
+            }
+            for item in drafts
+        ],
+    ]
+    if "profile" in resource_ids:
+        resource_snapshots.append({
+            "resource_id": "profile",
+            "label": "已确认画像",
+            "kind": "profile",
+            "readable": bool(profile.confirmed),
+            "content_hash": content_hash({
+                "id": profile.id,
+                "updated_at": profile.updated_at.isoformat(),
+                "confirmed": profile.confirmed,
+            }),
+        })
+    if "confirmed_experiences" in resource_ids:
+        confirmed = [item for item in experiences if item.confirmed]
+        resource_snapshots.append({
+            "resource_id": "confirmed_experiences",
+            "label": "已确认经历",
+            "kind": "experiences",
+            "readable": bool(confirmed),
+            "content_hash": content_hash([
+                {"id": item.id, "updated_at": item.updated_at.isoformat()}
+                for item in confirmed
+            ]),
+        })
+    conversation_memory, recent_history = build_conversation_memory(
+        conversation_history,
+        conversation.memory_state if conversation else {},
+        resource_ids,
+        resource_snapshots,
+    )
+    if conversation:
+        conversation.memory_state = conversation_memory
     return {
         "goal": goal,
         "skill": skill_name,
@@ -115,9 +185,10 @@ async def build_context(
             for item in unique_memories.values()
         ],
         "conversation_history": [
-            {"role": item.role, "content": item.content}
-            for item in conversation_history
+            {"role": item["role"], "content": item["content"]}
+            for item in recent_history
         ],
+        "conversation_memory": conversation_memory,
         "resource_ids": list(resource_ids),
         "reference_documents": [{
             "id": item.id,

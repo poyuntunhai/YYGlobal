@@ -3,6 +3,9 @@ from io import BytesIO
 
 import fitz
 from docx import Document as WordDocument
+from sqlalchemy import select
+
+from app.models.entities import Program
 
 
 def test_health_and_seed_catalog(client):
@@ -17,6 +20,12 @@ def test_health_and_seed_catalog(client):
     assert {item["field"] for item in programs.json()} >= {
         "Computer Science", "Business Analytics", "Finance", "Accounting", "Public Policy"
     }
+    assert {item["country"] for item in programs.json()} >= {"United States", "United Kingdom"}
+    named_search = client.get(
+        "/api/programs?q=Rice%20University%20Computer%20Science&personalized=false"
+    )
+    assert named_search.status_code == 200
+    assert [item["university"] for item in named_search.json()] == ["Rice University"]
 
 
 def test_profile_confirmation_writes_memory(client):
@@ -59,6 +68,57 @@ def test_profile_confirmation_writes_memory(client):
     assert exported.headers["content-disposition"].endswith('"yyglobal-profile.json"')
     assert exported.json()["profile"]["full_name"] == "测试学生"
     assert exported.json()["memories"]
+
+
+def test_recommendation_goal_is_persistent_and_canonical(client):
+    response = client.put("/api/recommendation-goal", json={
+        "target_countries": ["英国", "USA"],
+        "target_fields": ["Computer Science", "Artificial Intelligence"],
+        "target_university": "Imperial College London",
+        "intake": "2027 Fall",
+        "budget": 70000,
+        "max_qs_rank": 100,
+    })
+    assert response.status_code == 200
+    assert response.json()["target_countries"] == ["United Kingdom", "United States"]
+    assert response.json()["target_fields"] == ["Computer Science", "Artificial Intelligence"]
+    assert response.json()["target_university"] == "Imperial College London"
+    assert response.json()["max_qs_rank"] == 100
+    saved = client.get("/api/recommendation-goal")
+    assert saved.status_code == 200
+    assert saved.json() == response.json()
+
+    universities = client.get("/api/programs/universities")
+    assert universities.status_code == 200
+    assert {
+        (item["university"], item["country"]) for item in universities.json()
+    } >= {("Imperial College London", "United Kingdom")}
+    assert any(item["university"] == "Rice University" for item in universities.json())
+    regional_universities = client.get(
+        "/api/programs/universities",
+        params=[
+            ("countries", "Hong Kong"),
+            ("countries", "Singapore"),
+            ("max_qs_rank", "50"),
+        ],
+    )
+    assert regional_universities.status_code == 200
+    assert {item["university"] for item in regional_universities.json()} == {
+        "National University of Singapore (NUS)",
+        "Nanyang Technological University",
+        "The University of Hong Kong",
+        "The Chinese University of Hong Kong",
+        "The Hong Kong University of Science and Technology",
+    }
+    reset = client.put("/api/recommendation-goal", json={
+        "target_countries": ["United States"],
+        "target_fields": ["Computer Science"],
+        "target_university": "",
+        "intake": "2027 Fall",
+        "budget": 70000,
+        "max_qs_rank": 100,
+    })
+    assert reset.status_code == 200
 
 
 def test_generate_and_edit_complete_cv_and_ps_from_confirmed_profile(client):
@@ -216,21 +276,18 @@ def test_shortlist_materials_and_timeline(client):
     assert packages.status_code == 200
     assert {item["program"]["id"] for item in packages.json()} >= set(ids)
     assert all(not item["ready"] for item in packages.json() if item["program"]["id"] in ids)
-    assert all(item["checklist"] for item in packages.json() if item["program"]["id"] in ids)
-    first_package = next(item for item in packages.json() if item["program"]["id"] == ids[0])
-    first_material = first_package["checklist"][0]
-    cannot_fake_ready = client.patch(
-        f"/api/application-packages/{first_package['id']}/materials",
-        json={
-            "material_key": first_material["material_key"],
-            "status": "ready",
-            "selected_asset_type": "document",
-            "selected_asset_id": "fake",
-            "note": "",
-        },
+    assert all(
+        {row["category"] for row in item["checklist"]}
+        >= {"cv", "ps", "transcript", "recommendation", "language"}
+        for item in packages.json()
+        if item["program"]["id"] in ids
     )
-    assert cannot_fake_ready.status_code == 422
-    assert "官网材料要求尚未核验" in cannot_fake_ready.text
+    first_package = next(item for item in packages.json() if item["program"]["id"] == ids[0])
+    cannot_confirm_unready = client.post(
+        f"/api/application-packages/{first_package['id']}/confirm-plan"
+    )
+    assert cannot_confirm_unready.status_code == 422
+    assert "仍有材料没有完成准备" in cannot_confirm_unready.text
 
     materials = client.post("/api/material-plans", json={"program_id": ids[0]})
     assert materials.status_code == 201
@@ -273,27 +330,43 @@ def test_recommendations_and_persistent_shortlist_membership(client, monkeypatch
         ],
     }
     assert client.put("/api/profile", json=profile).status_code == 200
+    assert client.put("/api/recommendation-goal", json={
+        "target_countries": ["United States"],
+        "target_fields": ["Computer Science"],
+        "intake": "2027 Fall",
+        "budget": 70000,
+        "max_qs_rank": 100,
+    }).status_code == 200
 
-    async def skip_live_fetch(session, program):
-        return None, {}
+    async def fake_online_workflow(session, goal, *, excluded_program_ids, limit):
+        programs = list((await session.scalars(select(Program).where(Program.active.is_(True)))).all())
+        selected = [item for item in programs if item.id not in excluded_program_ids][:limit]
+        return selected, None
 
-    monkeypatch.setattr("app.api.router.verify_program_official", skip_live_fetch)
+    monkeypatch.setattr(
+        "app.api.router.run_online_program_recommendation", fake_online_workflow
+    )
     recommendations = client.post("/api/programs/recommendations?limit=5")
     assert recommendations.status_code == 200
     body = recommendations.json()
     assert len(body) == 5
     assert all(item["reasons"] for item in body)
+    assert all(item["verification_status"] == "verified" for item in body)
+    assert all(item["verification_error"] == "" for item in body)
     assert [item["score"] for item in body] == sorted(
         [item["score"] for item in body], reverse=True
     )
 
     first_ids = [item["program"]["id"] for item in body]
+
     next_page = client.post(
         "/api/programs/recommendations?limit=5&exclude_ids=" + ",".join(first_ids)
     )
     assert next_page.status_code == 200
     next_ids = [item["program"]["id"] for item in next_page.json()]
     assert set(first_ids).isdisjoint(next_ids)
+    assert all(item["verification_status"] == "verified" for item in next_page.json())
+    assert all(item["verification_error"] == "" for item in next_page.json())
 
     program_ids = [item["program"]["id"] for item in body[:2]]
     added = client.post("/api/shortlists/items", json={"program_ids": program_ids})
@@ -341,6 +414,7 @@ def test_skills_and_demo_mcp(client):
     trace = client.get(f"/api/agent-runs/{result.json()['run_id']}/trace")
     assert trace.status_code == 200
     assert trace.json()["tool_calls"][0]["tool_name"] == "mcp_catalog_search"
+    assert "step_id" in trace.json()["tool_calls"][0]
 
 
 def test_agent_harness_sse_and_trace(client):

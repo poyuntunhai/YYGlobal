@@ -6,13 +6,27 @@ import pytest
 from app.agent.provider import DashScopeChatProvider
 from app.agent.skills import local_skill_output, parse_skill_output, skill_registry
 from app.core.database import SessionLocal
-from app.schemas.api import ProfileUpdate
-from app.services.business import search_programs_for_profile, update_profile
+from app.schemas.api import ProfileUpdate, RecommendationGoalUpdate
+from app.services.business import (
+    canonical_countries,
+    search_programs_for_profile,
+    update_profile,
+    update_recommendation_goal,
+)
 from app.services.requirements import (
     extract_requirement_candidates,
+    extract_source_requirements,
     merge_ai_extraction,
     merge_source_extractions,
 )
+
+
+def test_country_aliases_are_canonicalized():
+    assert canonical_countries(["英国", "UK", "United Kingdom"]) == ["United Kingdom"]
+    assert canonical_countries(["美国", "USA"]) == ["United States"]
+    assert canonical_countries(
+        ["Hong Kong SAR", "Hong Kong SAR, China", "中国香港"]
+    ) == ["Hong Kong"]
 
 
 async def test_catalog_is_driven_by_profile_target_field():
@@ -24,6 +38,14 @@ async def test_catalog_is_driven_by_profile_target_field():
                 target_countries=["United States"],
                 target_fields=["商科"],
                 confirmed=True,
+            ),
+        )
+        await update_recommendation_goal(
+            session,
+            RecommendationGoalUpdate(
+                target_countries=["United States"],
+                target_fields=["商科"],
+                max_qs_rank=100,
             ),
         )
         business = await search_programs_for_profile(session)
@@ -40,9 +62,18 @@ async def test_catalog_is_driven_by_profile_target_field():
                 confirmed=True,
             ),
         )
+        await update_recommendation_goal(
+            session,
+            RecommendationGoalUpdate(
+                target_countries=["United States"],
+                target_fields=["计算机"],
+                max_qs_rank=100,
+            ),
+        )
         computer = await search_programs_for_profile(session)
-        assert len(computer) >= 20
+        assert computer
         assert {item.field for item in computer} == {"Computer Science"}
+        assert all(item.qs_rank is not None and item.qs_rank <= 100 for item in computer)
         assert all("cs" in item.official_url.lower() or "computer" in item.official_url.lower() for item in computer)
 
         for target, expected in [
@@ -57,10 +88,78 @@ async def test_catalog_is_driven_by_profile_target_field():
                     target_countries=["United States"], target_fields=[target], confirmed=True
                 ),
             )
+            await update_recommendation_goal(
+                session,
+                RecommendationGoalUpdate(
+                    target_countries=["United States"],
+                    target_fields=[target],
+                    max_qs_rank=100,
+                ),
+            )
             matched = await search_programs_for_profile(session)
             assert matched, target
             assert {item.field for item in matched} == expected
             assert all(item.official_url.startswith("https://") for item in matched)
+
+
+async def test_recommendation_goal_supports_multiple_countries_fields_and_rank_limit():
+    async with SessionLocal() as session:
+        await update_profile(session, ProfileUpdate(confirmed=True))
+        await update_recommendation_goal(
+            session,
+            RecommendationGoalUpdate(
+                target_countries=["英国", "美国"],
+                target_fields=["Computer Science", "Public Policy"],
+                max_qs_rank=50,
+            ),
+        )
+        matched = await search_programs_for_profile(session)
+        assert matched
+        assert {item.country for item in matched} == {"United States", "United Kingdom"}
+        assert {item.field for item in matched} == {"Computer Science", "Public Policy"}
+        assert all(item.qs_rank is not None and item.qs_rank <= 50 for item in matched)
+
+
+async def test_selected_university_overrides_country_but_keeps_other_filters():
+    async with SessionLocal() as session:
+        await update_profile(session, ProfileUpdate(confirmed=True))
+        await update_recommendation_goal(
+            session,
+            RecommendationGoalUpdate(
+                target_countries=["United States"],
+                target_fields=["Computer Science"],
+                target_university="Imperial College London",
+                max_qs_rank=100,
+            ),
+        )
+        matched = await search_programs_for_profile(session)
+        assert matched
+        assert {item.university for item in matched} == {"Imperial College London"}
+        assert {item.country for item in matched} == {"United Kingdom"}
+        assert {item.field for item in matched} == {"Computer Science"}
+        assert all(item.qs_rank is not None and item.qs_rank <= 100 for item in matched)
+
+
+async def test_unknown_custom_field_does_not_match_every_program():
+    async with SessionLocal() as session:
+        await update_profile(session, ProfileUpdate(confirmed=True))
+        await update_recommendation_goal(
+            session,
+            RecommendationGoalUpdate(
+                target_countries=["United States"],
+                target_fields=["Marine Biology"],
+                max_qs_rank=100,
+            ),
+        )
+        assert await search_programs_for_profile(session) == []
+        await update_recommendation_goal(
+            session,
+            RecommendationGoalUpdate(
+                target_countries=["United States"],
+                target_fields=["Computer Science"],
+                max_qs_rank=100,
+            ),
+        )
 
 
 def test_requirement_extraction_covers_deadline_tuition_materials_and_verbatim_evidence():
@@ -108,6 +207,58 @@ def test_requirement_extraction_keeps_all_rounds_and_rejects_graduation_gpa():
     table = extract_requirement_candidates(table_text)
     assert table["deadline"] == "2027-01-05"
     assert table["deadlines"][0]["raw"] == "January 5, 2027"
+
+
+def test_requirement_extraction_rejects_toefl_code_and_preserves_hkd_currency():
+    text = """
+    Please note that the University's TOEFL institution code is 9671.
+    Tuition: HK$350,000 for the whole programme.
+    """
+    extracted = extract_requirement_candidates(text)
+    assert "TOEFL" not in extracted["language"]
+    assert extracted["tuition"] == 350000
+    assert extracted["currency"] == "HKD"
+
+
+def test_requirement_extraction_reads_split_label_values_and_admission_section():
+    text = """
+    Tuition Fee
+    HK$ 350,000 for the whole programme
+    Admission Requirements
+    In addition to the general requirements, applicants should have:
+    - obtained a bachelor's degree in Engineering or Science discipline.
+    - two years of relevant professional work experience.
+    Application Deadline
+    """
+    extracted = extract_requirement_candidates(text)
+    assert extracted["tuition"] == 350000
+    assert extracted["currency"] == "HKD"
+    assert len(extracted["prerequisites"]) == 3
+    assert {item["field"] for item in extracted["evidence"]} == {
+        "tuition",
+        "prerequisites",
+    }
+
+
+@pytest.mark.asyncio
+async def test_master_admission_evidence_keeps_bachelor_background_requirement():
+    text = """
+    Admission Requirements
+    Applicants should have obtained a bachelor's degree in Engineering or Science.
+    Applicants from other disciplines should have two years of relevant professional work experience.
+    """
+    extracted = await extract_source_requirements(
+        SimpleNamespace(degree="master"),
+        SimpleNamespace(content=text),
+        use_ai=False,
+    )
+    quotes = [
+        item["quote"]
+        for item in extracted["evidence"]
+        if item["field"] == "prerequisites"
+    ]
+    assert any("bachelor's degree" in quote for quote in quotes)
+    assert any("professional work experience" in quote for quote in quotes)
 
 
 def test_ai_requirement_evidence_must_exist_verbatim():

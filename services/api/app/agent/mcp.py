@@ -54,6 +54,8 @@ class DemoCatalogMCPAdapter:
                     "id": item.id,
                     "university": item.university,
                     "name": item.name,
+                    "degree": item.degree,
+                    "country": item.country,
                     "field": item.field,
                     "official_url": item.official_url,
                 }

@@ -2,8 +2,6 @@
   <img src="docs/assets/yyglobal-hero-v3.png" alt="YYGlobal — AI-native study abroad application workspace" width="100%" />
 </p>
 
-<h1 align="center">YYGlobal</h1>
-
 <p align="center">
   <strong>面向留学场景的开放式 Agent：理解目标，调用工具，处理材料，持续完成任务</strong>
 </p>
@@ -15,6 +13,12 @@
 
 <p align="center">
   <img alt="Status" src="https://img.shields.io/badge/status-early%20access-163528?style=for-the-badge" />
+  <a href="https://github.com/limouren2000/YYGlobal/stargazers">
+    <img alt="GitHub Stars" src="https://img.shields.io/github/stars/limouren2000/YYGlobal?style=for-the-badge&logo=github&logoColor=white&labelColor=C92A5B&color=FF5C8A" />
+  </a>
+  <a href="https://github.com/limouren2000/YYGlobal/forks">
+    <img alt="GitHub Forks" src="https://img.shields.io/github/forks/limouren2000/YYGlobal?style=for-the-badge&logo=github&logoColor=white&labelColor=6D28D9&color=A78BFA" />
+  </a>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" />
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-Agent%20API-009688?style=for-the-badge&logo=fastapi&logoColor=white" />
   <img alt="Next.js" src="https://img.shields.io/badge/Next.js-15-000000?style=for-the-badge&logo=nextdotjs&logoColor=white" />

@@ -1,4 +1,5 @@
 import hashlib
+import re
 from typing import Any, Dict, List
 
 import fitz
@@ -7,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.entities import (
-    EvidenceChunk,
     Document,
+    EvidenceChunk,
     MaterialArtifact,
     MCPConnection,
     Program,
@@ -17,6 +18,7 @@ from app.models.entities import (
     SkillVersion,
     Workspace,
 )
+from app.services.rankings import qs_rank_for_university
 
 PROGRAMS: List[Dict[str, Any]] = [
     {
@@ -119,7 +121,7 @@ PROGRAMS: List[Dict[str, Any]] = [
         "university": "Rice University",
         "name": "Master of Computer Science",
         "city": "Houston",
-        "url": "https://csweb.rice.edu/academics/graduate-programs/professional-masters-program",
+        "url": "https://csweb.rice.edu/academics/graduate-programs/masters-programs",
     },
     {
         "university": "University of California, Irvine",
@@ -219,33 +221,50 @@ PROGRAMS: List[Dict[str, Any]] = [
         "duration_months": 24,
         "url": "https://fordschool.umich.edu/mpp-mpa/mpp",
     },
+    {
+        "university": "Imperial College London",
+        "name": "MSc Advanced Computing",
+        "city": "London",
+        "country": "United Kingdom",
+        "duration_months": 12,
+        "url": "https://www.imperial.ac.uk/engineering/departments/computing/prospective-students/courses/pg/mac/",
+    },
+    {
+        "university": "University of Edinburgh",
+        "name": "MSc Computer Science",
+        "city": "Edinburgh",
+        "country": "United Kingdom",
+        "duration_months": 12,
+        "url": "https://study.ed.ac.uk/programmes/postgraduate-taught/110-computer-science",
+    },
+    {
+        "university": "University of Manchester",
+        "name": "MSc Advanced Computer Science",
+        "city": "Manchester",
+        "country": "United Kingdom",
+        "duration_months": 12,
+        "url": "https://www.cs.manchester.ac.uk/study/masters/courses/",
+    },
+    {
+        "university": "King's College London",
+        "name": "MSc Advanced Computing",
+        "city": "London",
+        "country": "United Kingdom",
+        "duration_months": 12,
+        "url": "https://www.kcl.ac.uk/study/postgraduate-taught/courses/advanced-computing-msc",
+    },
+    {
+        "university": "University of Warwick",
+        "name": "MSc Computer Science",
+        "city": "Coventry",
+        "country": "United Kingdom",
+        "duration_months": 12,
+        "url": "https://warwick.ac.uk/study/postgraduate/courses/msc-computer-science/",
+    },
 ]
 
-
-FIELD_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "Computer Science": {
-        "prerequisites": ["Programming", "Data Structures", "Algorithms"],
-        "materials": ["CV", "PS", "成绩单", "3 封推荐信", "语言成绩"],
-    },
-    "Business Analytics": {
-        "prerequisites": ["Calculus", "Statistics", "Programming"],
-        "materials": ["CV", "Essays / PS", "成绩单", "推荐信", "语言成绩", "GMAT / GRE（如要求）"],
-    },
-    "Accounting": {
-        "prerequisites": ["Accounting", "General Business"],
-        "materials": ["CV", "Essays", "成绩单", "推荐信", "语言成绩", "GMAT / GRE（如要求）"],
-    },
-    "Finance": {
-        "prerequisites": ["Calculus", "Statistics", "Finance / Economics"],
-        "materials": ["CV", "Essays / PS", "成绩单", "推荐信", "语言成绩", "GMAT / GRE"],
-    },
-    "Public Policy": {
-        "prerequisites": ["Quantitative preparation"],
-        "materials": ["CV", "Essays / PS", "成绩单", "推荐信", "语言成绩", "GRE / GMAT（如要求）"],
-    },
-}
-
-
+# QS World University Rankings 2026. The year is stored with every value so the
+# UI never presents a rank without its edition.
 async def seed_database(session: AsyncSession) -> None:
     if await session.get(Workspace, settings.local_owner_id) is None:
         session.add(Workspace(id=settings.local_owner_id))
@@ -314,18 +333,19 @@ async def seed_database(session: AsyncSession) -> None:
             if existing is not None:
                 existing.official_url = item["url"]
         field = item.get("field", "Computer Science")
-        defaults = FIELD_DEFAULTS[field]
         if existing is None:
             existing = Program(
                 university=item["university"],
                 name=item["name"],
                 degree="Master",
-                country="United States",
+                country=item.get("country", "United States"),
                 city=item["city"],
                 field=field,
                 duration_months=item.get("duration_months", 24),
                 tuition=None,
-                currency="USD",
+                currency="GBP" if item.get("country") == "United Kingdom" else "USD",
+                qs_rank=qs_rank_for_university(item["university"]),
+                qs_ranking_year=2026,
                 official_url=item["url"],
                 summary="项目目录来自院校官方项目页；具体费用和申请要求需逐字段核验官网证据。",
             )
@@ -349,8 +369,8 @@ async def seed_database(session: AsyncSession) -> None:
                     deadlines=[],
                     min_gpa=None,
                     language={},
-                    prerequisites=defaults["prerequisites"],
-                    materials=defaults["materials"],
+                    prerequisites=[],
+                    materials=[],
                     fees={},
                     source_ids=[source.id],
                     verified=False,
@@ -359,6 +379,10 @@ async def seed_database(session: AsyncSession) -> None:
         else:
             existing.field = field
             existing.degree = "Master"
+            existing.country = item.get("country", "United States")
+            existing.currency = "GBP" if existing.country == "United Kingdom" else "USD"
+            existing.qs_rank = qs_rank_for_university(item["university"])
+            existing.qs_ranking_year = 2026 if existing.qs_rank is not None else None
             existing.duration_months = item.get("duration_months", existing.duration_months)
             existing.summary = (
                 "项目目录来自院校官方项目页；具体费用和申请要求需逐字段核验官网证据。"
@@ -381,7 +405,27 @@ async def seed_database(session: AsyncSession) -> None:
                     requirement.deadlines = []
                     requirement.min_gpa = None
                     requirement.language = {}
+                    requirement.prerequisites = []
+                    requirement.materials = []
                     requirement.fees = {}
+            if requirement is not None and existing.degree.lower().startswith("master"):
+                evidence_rows = list((await session.scalars(select(EvidenceChunk).where(
+                    EvidenceChunk.program_id == existing.id,
+                    EvidenceChunk.field.in_(["materials", "deadline", "prerequisites"]),
+                ))).all())
+                mismatched = [
+                    evidence
+                    for evidence in evidence_rows
+                    if re.search(r"\bph\.?\s*d\.?\b|doctoral", evidence.quote, re.I)
+                    and not re.search(r"\bmaster(?:'s)?\b|\bm\.?s\.?\b", evidence.quote, re.I)
+                ]
+                if mismatched:
+                    for evidence in mismatched:
+                        await session.delete(evidence)
+                    # A mixed-degree extraction cannot safely preserve its derived
+                    # checklist. Force a clean website verification on the next run.
+                    requirement.materials = []
+                    requirement.verified = False
             seed_source = await session.scalar(
                 select(ProgramSource).where(
                     ProgramSource.program_id == existing.id,

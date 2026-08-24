@@ -2,15 +2,17 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.mcp import demo_mcp
 from app.agent.memory import persist_confirmed_memory
+from app.agent.validators import evaluate_tool_result
 from app.core.config import settings
-from app.models.entities import Document, ProgramSource, Task, ToolCall
+from app.models.entities import AgentRun, AgentStep, Document, ProgramSource, Task, ToolCall
 from app.services.business import (
     create_material_plan,
     create_shortlist,
@@ -20,6 +22,7 @@ from app.services.business import (
     get_requirement,
     search_programs_for_profile,
 )
+from app.services.program_discovery import discover_official_programs
 from app.services.requirements import (
     extract_and_save_requirements,
     fetch_official_source,
@@ -37,6 +40,8 @@ class ToolSpec:
     handler: ToolHandler
     mutates_data: bool = False
     approval_required: bool = False
+    timeout_seconds: Optional[int] = None
+    max_retries: Optional[int] = None
 
     def as_openai_tool(self) -> Dict[str, Any]:
         return {
@@ -128,6 +133,7 @@ async def tool_search_programs(session: AsyncSession, arguments: Dict[str, Any])
             "id": item.id,
             "university": item.university,
             "name": item.name,
+            "degree": item.degree,
             "country": item.country,
             "field": item.field,
             "tuition": item.tuition,
@@ -136,6 +142,39 @@ async def tool_search_programs(session: AsyncSession, arguments: Dict[str, Any])
         }
         for item in items[:20]
     ]
+
+
+async def tool_discover_official_programs(session: AsyncSession, arguments: Dict[str, Any]) -> Any:
+    items, catalog_report = await discover_official_programs(
+        session,
+        countries=arguments["countries"],
+        fields=arguments["fields"],
+        degree_level=arguments["degree_level"],
+        target_university=arguments["target_university"],
+        max_qs_rank=int(arguments["max_qs_rank"]) or None,
+        excluded_program_ids=set(arguments["excluded_program_ids"]),
+        max_candidates=int(arguments["max_candidates"]),
+        school_offset=int(arguments.get("school_offset") or 0),
+        include_report=True,
+    )
+    return {
+        "items": [
+            {
+                "id": item.id,
+                "university": item.university,
+                "name": item.name,
+                "degree": item.degree,
+                "country": item.country,
+                "field": item.field,
+                "qs_rank": item.qs_rank,
+                "official_url": item.official_url,
+                "catalog_url": item.catalog_url,
+                "faculty_catalog_url": item.faculty_catalog_url,
+            }
+            for item in items
+        ],
+        "catalog_report": catalog_report,
+    }
 
 
 async def tool_compare_programs(session: AsyncSession, arguments: Dict[str, Any]) -> Any:
@@ -221,18 +260,42 @@ async def tool_extract_requirements(session: AsyncSession, arguments: Dict[str, 
     source = await session.get(ProgramSource, arguments["source_id"])
     if not program or not source or source.program_id != program.id:
         raise ValueError("项目或官网来源不存在")
-    return await extract_and_save_requirements(session, program, source)
+    result = await extract_and_save_requirements(session, program, source)
+    return {
+        "program_id": program.id,
+        "source_id": source.id,
+        "status": source.status,
+        **result,
+    }
 
 
 async def tool_verify_program_official(session: AsyncSession, arguments: Dict[str, Any]) -> Any:
     program = await get_program(session, arguments["program_id"])
     if not program:
         raise ValueError("项目不存在")
-    primary, extracted = await verify_program_official(session, program)
+    primary, extracted = await verify_program_official(
+        session, program, fast_mode=bool(arguments.get("fast_mode"))
+    )
+    evidence = list(extracted.get("evidence", []))
+    if arguments.get("fast_mode"):
+        evidence.insert(
+            0,
+            {
+                "field": "program_identity",
+                "quote": primary.title or program.name,
+                "value": program.name,
+                "confidence": 1.0,
+                "source_id": primary.id,
+                "url": primary.url,
+            },
+        )
     return {
         "program_id": program.id,
         "primary_source_id": primary.id,
-        "status": primary.status,
+        "status": "verified" if arguments.get("fast_mode") else primary.status,
+        "verification_scope": (
+            "official_program_identity" if arguments.get("fast_mode") else "admission_requirements"
+        ),
         "official_url": program.official_url,
         "deadline": extracted.get("deadline"),
         "deadlines": extracted.get("deadlines", []),
@@ -241,7 +304,7 @@ async def tool_verify_program_official(session: AsyncSession, arguments: Dict[st
         "materials": extracted.get("materials", []),
         "language": extracted.get("language", {}),
         "fees": extracted.get("fees", {}),
-        "evidence": extracted.get("evidence", []),
+        "evidence": evidence,
         "source_results": extracted.get("source_results", []),
     }
 
@@ -295,9 +358,18 @@ class ToolRegistry:
                         "preferences": {"type": "object"},
                     },
                     [
-                        "full_name", "current_school", "current_major", "degree", "gpa",
-                        "gpa_scale", "language_scores", "target_countries", "target_fields",
-                        "intake", "budget", "preferences",
+                        "full_name",
+                        "current_school",
+                        "current_major",
+                        "degree",
+                        "gpa",
+                        "gpa_scale",
+                        "language_scores",
+                        "target_countries",
+                        "target_fields",
+                        "intake",
+                        "budget",
+                        "preferences",
                     ],
                 ),
                 tool_save_profile,
@@ -318,6 +390,36 @@ class ToolRegistry:
                     ["query", "country", "field"],
                 ),
                 tool_search_programs,
+            )
+        )
+        self.register(
+            ToolSpec(
+                "discover_official_programs",
+                "Discover official university/faculty program catalogs first, enumerate catalog-bound program pages, validate identity and hard constraints, and cache current metadata.",
+                object_schema(
+                    {
+                        "countries": {"type": "array", "items": {"type": "string"}},
+                        "fields": {"type": "array", "items": {"type": "string"}},
+                        "degree_level": {"type": "string"},
+                        "target_university": {"type": "string"},
+                        "max_qs_rank": {"type": "number"},
+                        "excluded_program_ids": {"type": "array", "items": {"type": "string"}},
+                        "max_candidates": {"type": "number"},
+                        "school_offset": {"type": "number"},
+                    },
+                    [
+                        "countries",
+                        "fields",
+                        "degree_level",
+                        "target_university",
+                        "max_qs_rank",
+                        "excluded_program_ids",
+                        "max_candidates",
+                    ],
+                ),
+                tool_discover_official_programs,
+                timeout_seconds=settings.program_discovery_operation_timeout_seconds,
+                max_retries=0,
             )
         )
         self.register(
@@ -407,9 +509,16 @@ class ToolRegistry:
             ToolSpec(
                 "verify_program_official",
                 "Research the program page and relevant same-program official admissions/requirements/tuition pages, then persist evidence-backed fields.",
-                object_schema({"program_id": {"type": "string"}}, ["program_id"]),
+                object_schema(
+                    {
+                        "program_id": {"type": "string"},
+                        "fast_mode": {"type": "boolean"},
+                    },
+                    ["program_id"],
+                ),
                 tool_verify_program_official,
                 mutates_data=True,
+                timeout_seconds=settings.program_discovery_timeout_seconds,
             )
         )
         self.register(
@@ -418,8 +527,10 @@ class ToolRegistry:
                 "Update one application task after explicit user confirmation.",
                 object_schema(
                     {
-                        "task_id": {"type": "string"}, "status": {"type": "string"},
-                        "due_date": {"type": "string"}, "priority": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "status": {"type": "string"},
+                        "due_date": {"type": "string"},
+                        "priority": {"type": "string"},
                         "details": {"type": "string"},
                     },
                     ["task_id"],
@@ -441,6 +552,7 @@ class ToolRegistry:
         arguments: Dict[str, Any],
         allowed_names: List[str],
         approved: bool = False,
+        goal_spec: Optional[Dict[str, Any]] = None,
     ) -> Any:
         if name not in allowed_names or name not in self.tools:
             raise PermissionError(f"当前 Skill 无权使用工具：{name}")
@@ -448,37 +560,176 @@ class ToolRegistry:
         if tool.approval_required and not approved:
             raise PermissionError(f"工具 {name} 需要用户明确确认")
         validate_arguments(tool.parameters, arguments)
+        step = await self._resolve_step(session, run_id, name, goal_spec or {})
+        if goal_spec and goal_spec.get("recipe") == "program_research" and not step:
+            raise PermissionError(f"工具 {name} 不属于 Program Research Recipe 的任何步骤")
+        unmet_dependencies = await self._unmet_dependencies(session, run_id, step) if step else []
         started = time.perf_counter()
-        trace = ToolCall(run_id=run_id, tool_name=name, arguments=arguments, status="started")
+        trace = ToolCall(
+            run_id=run_id,
+            step_id=step.id if step else None,
+            tool_name=name,
+            arguments=arguments,
+            status="started",
+        )
         session.add(trace)
         await session.flush()
+        if unmet_dependencies:
+            evaluation = {
+                "verdict": "rejected",
+                "reason_code": "step_dependencies_not_satisfied",
+                "message": f"前置步骤尚未通过验收：{', '.join(unmet_dependencies)}",
+            }
+            trace.result = {"_evaluation": evaluation}
+            trace.status = "rejected"
+            step.checkpoint = {
+                **(step.checkpoint or {}),
+                "last_tool_call_id": trace.id,
+                "last_verdict": "rejected",
+                "unmet_dependencies": unmet_dependencies,
+            }
+            trace.duration_ms = int((time.perf_counter() - started) * 1000)
+            await session.commit()
+            return {
+                "error": "hard_constraint_failed",
+                "message": evaluation["message"],
+                "evaluation": evaluation,
+            }
+        if step:
+            step.status = "running"
+            step.checkpoint = {**(step.checkpoint or {}), "active_tool": name}
         try:
             result = None
-            for attempt in range(settings.agent_max_tool_retries + 1):
+            max_retries = (
+                settings.agent_max_tool_retries
+                if tool.max_retries is None
+                else tool.max_retries
+            )
+            for attempt in range(max_retries + 1):
                 try:
+                    timeout_seconds = tool.timeout_seconds or settings.agent_tool_timeout_seconds
                     result = await asyncio.wait_for(
                         tool.handler(session, arguments),
-                        timeout=settings.agent_tool_timeout_seconds,
+                        timeout=timeout_seconds,
                     )
                     break
                 except (TimeoutError, asyncio.TimeoutError) as exc:
-                    if attempt >= settings.agent_max_tool_retries:
-                        raise TimeoutError(
-                            f"工具 {name} 超过 {settings.agent_tool_timeout_seconds} 秒"
-                        ) from exc
+                    if attempt >= max_retries:
+                        raise TimeoutError(f"工具 {name} 超过 {timeout_seconds} 秒") from exc
                 except (ConnectionError, httpx.TransportError):
-                    if attempt >= settings.agent_max_tool_retries:
+                    if attempt >= max_retries:
                         raise
-            trace.result = json.loads(json.dumps(result, ensure_ascii=False, default=str))
-            trace.status = "completed"
+            serialized = json.loads(json.dumps(result, ensure_ascii=False, default=str))
+            evaluation = evaluate_tool_result(goal_spec or {}, name, serialized)
+            stored_result = (
+                {**serialized, "_evaluation": evaluation}
+                if isinstance(serialized, dict)
+                else {"items": serialized, "_evaluation": evaluation}
+            )
+            trace.result = stored_result
+            verdict = evaluation.get("verdict", "accepted")
+            trace.status = "rejected" if verdict == "rejected" else "completed"
+            if step:
+                step.status = (
+                    "rejected"
+                    if verdict == "rejected"
+                    else ("running" if verdict == "progress" else "accepted")
+                )
+                step.result = {"tool": name, "evaluation": evaluation}
+                step.checkpoint = {
+                    **(step.checkpoint or {}),
+                    "last_tool_call_id": trace.id,
+                    "last_verdict": verdict,
+                }
+            await self._sync_plan_status(session, run_id)
+            if verdict == "rejected":
+                rejection = {
+                    "error": "hard_constraint_failed",
+                    "message": evaluation.get("message", "工具结果未通过验收。"),
+                    "evaluation": evaluation,
+                }
+                return {**result, **rejection} if isinstance(result, dict) else rejection
             return result
         except Exception as exc:
             trace.status = "error"
             trace.error = str(exc)[:1000]
+            if step:
+                step.status = "failed"
+                step.result = {"tool": name, "error": str(exc)[:1000]}
+                await self._sync_plan_status(session, run_id)
             raise
         finally:
             trace.duration_ms = int((time.perf_counter() - started) * 1000)
             await session.commit()
+
+    async def _resolve_step(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        tool_name: str,
+        goal_spec: Dict[str, Any],
+    ) -> Optional[AgentStep]:
+        if goal_spec.get("recipe") != "program_research":
+            return None
+        run = await session.get(AgentRun, run_id)
+        if not run:
+            return None
+        position = next(
+            (
+                index
+                for index, item in enumerate(run.plan or [])
+                if tool_name in (item.get("allowed_tools") or [])
+            ),
+            None,
+        )
+        if position is None:
+            return None
+        return await session.scalar(
+            select(AgentStep).where(AgentStep.run_id == run_id, AgentStep.position == position)
+        )
+
+    async def _unmet_dependencies(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        step: AgentStep,
+    ) -> List[str]:
+        run = await session.get(AgentRun, run_id)
+        if not run or step.position >= len(run.plan or []):
+            return []
+        dependency_ids = set((run.plan or [])[step.position].get("dependencies") or [])
+        if not dependency_ids:
+            return []
+        steps = list(
+            (await session.scalars(select(AgentStep).where(AgentStep.run_id == run_id))).all()
+        )
+        by_plan_id = {
+            str((item.checkpoint or {}).get("plan_id") or f"step-{item.position + 1}"): item
+            for item in steps
+        }
+        return sorted(
+            dependency_id
+            for dependency_id in dependency_ids
+            if dependency_id not in by_plan_id
+            or by_plan_id[dependency_id].status not in {"accepted", "completed"}
+        )
+
+    async def _sync_plan_status(self, session: AsyncSession, run_id: str) -> None:
+        run = await session.get(AgentRun, run_id)
+        if not run:
+            return
+        steps = list(
+            (
+                await session.scalars(
+                    select(AgentStep).where(AgentStep.run_id == run_id).order_by(AgentStep.position)
+                )
+            ).all()
+        )
+        statuses = {step.position: step.status for step in steps}
+        run.plan = [
+            {**item, "status": statuses.get(index, item.get("status", "pending"))}
+            for index, item in enumerate(run.plan or [])
+        ]
 
 
 tool_registry = ToolRegistry()

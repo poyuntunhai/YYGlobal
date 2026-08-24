@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import ipaddress
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 from urllib.parse import urljoin, urlparse
 
@@ -44,6 +44,7 @@ class FetchedPage:
     text: str
     content_hash: str
     related_links: List[Dict[str, str]]
+    links: List[Dict[str, str]] = field(default_factory=list)
 
 
 async def fetch_page(url: str) -> FetchedPage:
@@ -63,16 +64,28 @@ async def fetch_page(url: str) -> FetchedPage:
         extracted = soup.get_text("\n", strip=True)
     text = extracted[:200_000]
     related_links = []
+    links = []
     seen = set()
+    all_seen = set()
     keywords = (
-        "admission", "application", "apply", "requirement", "deadline",
-        "tuition", "fee", "cost", "financial", "how to apply",
+        "admission",
+        "application",
+        "apply",
+        "requirement",
+        "deadline",
+        "tuition",
+        "fee",
+        "cost",
+        "financial",
+        "how to apply",
     )
     origin = urlparse(final_url)
     origin_domain = ".".join((origin.hostname or "").lower().split(".")[-2:])
     origin_segments = [
-        segment for segment in origin.path.lower().split("/")
-        if segment and segment not in {"admission", "admissions", "program", "programs", "graduate", "masters"}
+        segment
+        for segment in origin.path.lower().split("/")
+        if segment
+        and segment not in {"admission", "admissions", "program", "programs", "graduate", "masters"}
     ]
     program_markers = origin_segments[:2]
     for anchor in soup.select("a[href]"):
@@ -80,6 +93,14 @@ async def fetch_page(url: str) -> FetchedPage:
         candidate = urljoin(final_url, anchor.get("href", "")).split("#", 1)[0]
         parsed = urlparse(candidate)
         candidate_domain = ".".join((parsed.hostname or "").lower().split(".")[-2:])
+        if (
+            parsed.scheme in {"http", "https"}
+            and candidate_domain == origin_domain
+            and candidate != final_url
+            and candidate not in all_seen
+        ):
+            all_seen.add(candidate)
+            links.append({"url": candidate, "label": label[:300]})
         searchable = f"{label} {parsed.path} {parsed.query}".lower()
         same_program_path = not program_markers or any(
             marker in searchable for marker in program_markers
@@ -102,4 +123,5 @@ async def fetch_page(url: str) -> FetchedPage:
         text=text,
         content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         related_links=related_links,
+        links=links[:800],
     )

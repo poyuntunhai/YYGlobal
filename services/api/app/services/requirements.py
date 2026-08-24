@@ -23,6 +23,14 @@ MATERIAL_KEYWORDS = {
     "GRE / GMAT": ["gre", "gmat"],
     "Portfolio": ["portfolio"],
 }
+VERIFICATION_EVIDENCE_FIELDS = {
+    "deadline", "materials", "TOEFL", "IELTS", "min_gpa", "tuition",
+    "application_fee",
+}
+
+
+def _has_admission_core_evidence(fields: set) -> bool:
+    return bool(fields & VERIFICATION_EVIDENCE_FIELDS)
 
 
 def _admission_evidence_valid(field: str, quote: str) -> bool:
@@ -35,7 +43,17 @@ def _admission_evidence_valid(field: str, quote: str) -> bool:
             return False
         return any(word in lowered for word in ("admission", "applicant", "application", "undergraduate", "minimum", "required"))
     if field in {"TOEFL", "IELTS"}:
-        return not any(word in lowered for word in ("graduate from", "degree requirement"))
+        return not any(
+            word in lowered
+            for word in (
+                "graduate from",
+                "degree requirement",
+                "institution code",
+                "institutional code",
+                "school code",
+                "toefl code",
+            )
+        )
     if field == "materials":
         return any(word in lowered for word in ("submit", "upload", "application", "required", "provide", "must include"))
     if field == "prerequisites":
@@ -53,6 +71,49 @@ def _first_line(lines: List[str], patterns: List[str]) -> Optional[str]:
         if any(re.search(pattern, lowered, re.I) for pattern in patterns):
             return line[:1000]
     return None
+
+
+def _value_after_section_label(
+    lines: List[str],
+    *,
+    label_patterns: List[str],
+    value_patterns: List[str],
+    lookahead: int = 5,
+) -> Optional[str]:
+    """Read a value rendered on a line after its field label.
+
+    Many university programme pages render definition lists as separate text
+    lines (for example ``Tuition Fee`` followed by ``HK$ 350,000``). Evidence
+    remains the exact value line from the fetched page.
+    """
+    for index, line in enumerate(lines):
+        if not any(re.search(pattern, line, re.I) for pattern in label_patterns):
+            continue
+        for candidate in lines[index + 1 : index + 1 + lookahead]:
+            if any(re.search(pattern, candidate, re.I) for pattern in value_patterns):
+                return candidate[:1000]
+    return None
+
+
+def _admission_requirement_section(lines: List[str]) -> List[str]:
+    quotes: List[str] = []
+    collecting = False
+    stop_headings = {
+        "application deadline", "contact", "tuition fee", "study mode",
+        "minimum units required", "normative study period",
+    }
+    for line in lines:
+        lowered = line.casefold().strip().rstrip(":")
+        if re.fullmatch(r"admission requirements?", lowered):
+            collecting = True
+            continue
+        if collecting and lowered in stop_headings:
+            break
+        if collecting and len(line) >= 20:
+            quotes.append(line[:1000])
+        if len(quotes) >= 8:
+            break
+    return quotes
 
 
 def _deadline(line: Optional[str]) -> Optional[str]:
@@ -101,11 +162,26 @@ def extract_requirement_candidates(text: str) -> Dict[str, Any]:
     deadlines = _deadline_candidates(lines)
     deadline_line = deadlines[0]["raw"] if deadlines else None
     tuition_line = _first_line(lines, [r"tuition.{0,80}\$", r"\$.{0,30}tuition", r"tuition and fees"])
+    tuition_line = tuition_line or _value_after_section_label(
+        lines,
+        label_patterns=[r"^tuition(?: fee| fees)?$", r"^programme fee$"],
+        value_patterns=[r"(?:HK|US|S|A|C)?\$\s*[\d,]{3,}", r"\b(?:HKD|USD|SGD|AUD|CAD|GBP)\s*[\d,]{3,}"],
+    )
     fee_line = _first_line(lines, [r"application fee.{0,50}\$", r"\$.{0,20}application fee"])
+    fee_line = fee_line or _value_after_section_label(
+        lines,
+        label_patterns=[r"^application fee$"],
+        value_patterns=[r"(?:HK|US|S|A|C)?\$\s*[\d,]{2,}", r"\b(?:HKD|USD|SGD|AUD|CAD|GBP)\s*[\d,]{2,}"],
+    )
     gpa_line = _first_line(lines, [r"(?:minimum|required|admission|applicant|undergraduate).{0,50}gpa", r"gpa.{0,30}\d\.\d"])
     if gpa_line and not _admission_evidence_valid("min_gpa", gpa_line):
         gpa_line = None
-    toefl_line = _first_line(lines, [r"toefl.{0,50}\d{2,3}"])
+    toefl_line = _first_line(
+        lines,
+        [r"toefl.{0,50}\d{2,3}(?!\d)"],
+    )
+    if toefl_line and not _admission_evidence_valid("TOEFL", toefl_line):
+        toefl_line = None
     ielts_line = _first_line(lines, [r"ielts.{0,50}\d(?:\.\d)?"])
 
     def money(line: Optional[str]) -> Optional[float]:
@@ -113,6 +189,22 @@ def extract_requirement_candidates(text: str) -> Dict[str, Any]:
             return None
         match = re.search(r"\$\s*([\d,]{3,})", line)
         return float(match.group(1).replace(",", "")) if match else None
+
+    def currency(line: Optional[str]) -> str:
+        value = str(line or "").upper()
+        if "HK$" in value or "HKD" in value:
+            return "HKD"
+        if "S$" in value or "SGD" in value:
+            return "SGD"
+        if "A$" in value or "AUD" in value:
+            return "AUD"
+        if "C$" in value or "CAD" in value:
+            return "CAD"
+        if "£" in value or "GBP" in value:
+            return "GBP"
+        if "US$" in value or "USD" in value or "$" in value:
+            return "USD"
+        return ""
 
     def score(line: Optional[str], label: str, pattern: str) -> Optional[float]:
         if not line:
@@ -134,13 +226,19 @@ def extract_requirement_candidates(text: str) -> Dict[str, Any]:
         line for line in lines
         if re.search(r"prerequisite|required preparation|quantitative preparation", line, re.I)
     ][:8]
+    prerequisite_quotes = list(
+        dict.fromkeys([*prerequisite_quotes, *_admission_requirement_section(lines)])
+    )[:8]
     evidence = []
     values = {
         "deadline": (deadline_line, _deadline(deadline_line)),
         "tuition": (tuition_line, money(tuition_line)),
         "application_fee": (fee_line, money(fee_line)),
         "min_gpa": (gpa_line, score(gpa_line, "GPA", r"(?:GPA[^\d]{0,20})(\d\.\d{1,2})")),
-        "TOEFL": (toefl_line, score(toefl_line, "TOEFL", r"TOEFL[^\d]{0,30}(\d{2,3})")),
+        "TOEFL": (
+            toefl_line,
+            score(toefl_line, "TOEFL", r"TOEFL[^\d]{0,30}(\d{2,3})(?!\d)"),
+        ),
         "IELTS": (ielts_line, score(ielts_line, "IELTS", r"IELTS[^\d]{0,30}(\d(?:\.\d)?)")),
     }
     for field, (quote, value) in values.items():
@@ -152,7 +250,13 @@ def extract_requirement_candidates(text: str) -> Dict[str, Any]:
     for quote in dict.fromkeys(material_quotes):
         evidence.append({"field": "materials", "quote": quote, "value": "官网材料要求", "confidence": 0.7})
     for quote in prerequisite_quotes:
-        evidence.append({"field": "prerequisites", "quote": quote, "value": "先修要求", "confidence": 0.65})
+        evidence.append({
+            "field": "prerequisites",
+            "quote": quote,
+            "value": "入学背景要求",
+            "confidence": 0.7,
+            "admission_context": True,
+        })
     for deadline_item in deadlines:
         line, normalized = deadline_item["raw"], deadline_item["date"]
         if not any(item["field"] == "deadline" and item["quote"] == line for item in evidence):
@@ -165,7 +269,7 @@ def extract_requirement_candidates(text: str) -> Dict[str, Any]:
         "deadline": values["deadline"][1],
         "deadlines": deadlines,
         "tuition": values["tuition"][1],
-        "currency": "USD" if values["tuition"][1] is not None else "",
+        "currency": currency(tuition_line) if values["tuition"][1] is not None else "",
         "min_gpa": values["min_gpa"][1],
         "language": {
             key: values[key][1] for key in ("TOEFL", "IELTS") if values[key][1] is not None
@@ -173,7 +277,8 @@ def extract_requirement_candidates(text: str) -> Dict[str, Any]:
         "materials": materials,
         "prerequisites": prerequisite_quotes,
         "fees": {
-            "application_fee": values["application_fee"][1], "currency": "USD"
+            "application_fee": values["application_fee"][1],
+            "currency": currency(fee_line),
         } if values["application_fee"][1] is not None else {},
         "evidence": evidence,
     }
@@ -289,16 +394,67 @@ async def fetch_official_sources(
     return sources
 
 
-async def extract_source_requirements(program: Program, source: ProgramSource) -> Dict[str, Any]:
+async def extract_source_requirements(
+    program: Program, source: ProgramSource, *, use_ai: bool = True
+) -> Dict[str, Any]:
     extracted = extract_requirement_candidates(source.content)
     try:
         from app.agent.provider import provider
-        if provider.available:
+        if use_ai and provider.available:
             ai_data = await provider.extract_program_requirements(program, source.content)
             extracted = merge_ai_extraction(extracted, ai_data, source.content)
     except Exception as exc:
         extracted["ai_extraction_error"] = str(exc)[:300]
-    return sanitize_extraction_by_evidence(extracted, source.content)
+    cleaned = sanitize_extraction_by_evidence(extracted, source.content)
+    # Related admission pages may contain multiple degree levels. Explicitly
+    # level-scoped evidence must match the current program.
+    degree_value = program.degree.casefold()
+    current_level = (
+        "doctoral" if re.search(r"ph\.?\s*d\.?|doctoral|doctorate", degree_value)
+        else "undergraduate" if re.search(r"bachelor|undergraduate|b\.?s\.?c?", degree_value)
+        else "master"
+    )
+    degree_patterns = {
+        "doctoral": r"\bph\.?\s*d\.?\b|\bdoctoral\b|\bdoctorate\b",
+        "master": r"\bmaster(?:'s)?\b|\bm\.?s\.?c?\b|\bmcomp\b|\bmeng\b",
+        "undergraduate": r"\bbachelor(?:'s)?\b|\bundergraduate\b|\bb\.?s\.?c?\b",
+    }
+
+    def evidence_matches_level(item: Dict[str, Any]) -> bool:
+        if item.get("field") not in {"materials", "deadline", "prerequisites"}:
+            return True
+        quote = str(item.get("quote", ""))
+        explicit_levels = {
+            level for level, pattern in degree_patterns.items()
+            if re.search(pattern, quote, re.I)
+        }
+        if item.get("field") == "prerequisites":
+            # Entry requirements naturally mention the qualification below
+            # the target level: a master's page asks for a bachelor's degree,
+            # and a doctoral page may ask for a master's degree. Those are
+            # applicant-background facts, not evidence for the wrong program.
+            allowed_background_levels = {
+                "undergraduate": {"undergraduate"},
+                "master": {"undergraduate", "master"},
+                "doctoral": {"undergraduate", "master", "doctoral"},
+            }
+            return not explicit_levels or explicit_levels <= allowed_background_levels[current_level]
+        return not explicit_levels or current_level in explicit_levels
+
+    cleaned["evidence"] = [
+        item for item in cleaned.get("evidence", []) if evidence_matches_level(item)
+    ]
+    material_text = "\n".join(
+        str(item.get("quote", ""))
+        for item in cleaned["evidence"]
+        if item.get("field") == "materials"
+    ).lower()
+    cleaned["materials"] = [
+        label
+        for label, keywords in MATERIAL_KEYWORDS.items()
+        if any(keyword in material_text for keyword in keywords)
+    ]
+    return cleaned
 
 
 def merge_source_extractions(items: List[tuple]) -> Dict[str, Any]:
@@ -352,6 +508,11 @@ async def extract_and_save_requirements(
     if requirement is None:
         requirement = ProgramRequirement(program_id=program.id)
         session.add(requirement)
+    core = {item["field"] for item in extracted.get("evidence", [])}
+    if requirement.verified and not _has_admission_core_evidence(core):
+        source.status = "fetched_needs_review"
+        await session.commit()
+        return {**extracted, "preserved_previous_verified": True}
     # 每次核验都以本次官网证据为准。抽取不到即为未知，不能保留旧演示值或猜测值。
     requirement.deadline = extracted.get("deadline")
     requirement.deadline_raw = extracted.get("deadline_raw", "")
@@ -370,17 +531,24 @@ async def extract_and_save_requirements(
             quote=item["quote"][:5000], locator=source.url,
             confidence=float(item.get("confidence", 0.7)),
         ))
-    core = {item["field"] for item in extracted.get("evidence", [])}
-    requirement.verified = "deadline" in core and "materials" in core
+    requirement.verified = _has_admission_core_evidence(core)
     source.status = "verified" if requirement.verified else "fetched_needs_review"
     await session.commit()
     return extracted
 
 
-async def verify_program_official(session: AsyncSession, program: Program) -> tuple:
-    sources = await fetch_official_sources(session, program)
+async def verify_program_official(
+    session: AsyncSession,
+    program: Program,
+    *,
+    fast_mode: bool = False,
+) -> tuple:
+    sources = await fetch_official_sources(session, program, limit=3 if fast_mode else 4)
     extracted_values = await asyncio.gather(
-        *(extract_source_requirements(program, source) for source in sources)
+        *(
+            extract_source_requirements(program, source, use_ai=not fast_mode)
+            for source in sources
+        )
     )
     extracted_items = list(zip(sources, extracted_values))
     extracted = merge_source_extractions(extracted_items)
@@ -390,6 +558,13 @@ async def verify_program_official(session: AsyncSession, program: Program) -> tu
     if requirement is None:
         requirement = ProgramRequirement(program_id=program.id)
         session.add(requirement)
+    core = {item["field"] for item in extracted.get("evidence", [])}
+    if requirement.verified and not _has_admission_core_evidence(core):
+        for source in sources:
+            source.status = "fetched_needs_review"
+        await session.commit()
+        await session.refresh(sources[0])
+        return sources[0], {**extracted, "preserved_previous_verified": True}
     requirement.deadline = extracted.get("deadline")
     requirement.deadline_raw = extracted.get("deadline_raw", "")
     requirement.deadlines = extracted.get("deadlines") or []
@@ -411,8 +586,7 @@ async def verify_program_official(session: AsyncSession, program: Program) -> tu
             quote=item["quote"][:5000], locator=item["url"],
             confidence=float(item.get("confidence", 0.7)),
         ))
-    core = {item["field"] for item in extracted.get("evidence", [])}
-    requirement.verified = "deadline" in core and "materials" in core
+    requirement.verified = _has_admission_core_evidence(core)
     for source in sources:
         source.status = "verified" if requirement.verified else "fetched_needs_review"
     await session.commit()

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 
@@ -69,6 +70,16 @@ class MaterialAssistantResponse(BaseModel):
     content: str = ""
     source_experience_ids: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+
+
+class MaterialVerificationReport(BaseModel):
+    verdict: Literal["accepted", "revise", "rejected"]
+    summary: str
+    requirement_coverage: List[str] = Field(default_factory=list)
+    unsupported_claims: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    issues: List[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
 
 
 class OpenAIResponsesProvider:
@@ -150,6 +161,33 @@ class OpenAIResponsesProvider:
         result["model_info"] = {"provider": "openai", "model": settings.llm_reasoning_model}
         return result
 
+    async def verify_material(
+        self, payload: Dict[str, Any], candidate: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not self.client:
+            from app.agent.verifier import local_material_verification
+
+            return local_material_verification(payload, candidate)
+        response = await asyncio.to_thread(
+            self.client.responses.parse,
+            model=settings.llm_extraction_model,
+            instructions=material_verification_instructions(),
+            input=[{
+                "role": "user",
+                "content": json.dumps(
+                    {"context": payload, "candidate": candidate},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            }],
+            text_format=MaterialVerificationReport,
+        )
+        if response.output_parsed is None:
+            raise ValueError("独立验证器没有返回结构化报告")
+        result = response.output_parsed.model_dump()
+        result["mode"] = "openai-independent-verifier"
+        return result
+
     async def run(
         self,
         session: AsyncSession,
@@ -159,6 +197,7 @@ class OpenAIResponsesProvider:
         skill: Skill,
         tools: ToolRegistry,
         emit: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        goal_spec: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         if not self.client:
             return self._local_response(message, context, skill), {
@@ -186,8 +225,11 @@ class OpenAIResponsesProvider:
         instructions = (
             "你是 YYGlobal 留学申请 Agent。只使用上下文中的已确认事实；不确定时明确说明。"
             "种子项目数据必须提示用户在申请前核验官网。不得编造学生经历、成绩、截止日期或录取概率。\n\n"
-            "必须阅读结构化上下文中的 conversation_history、reference_documents 和 reference_drafts。"
+            "必须阅读结构化上下文中的 conversation_memory、conversation_history、reference_documents 和 reference_drafts。"
+            "conversation_memory.stable_summary 和 decisions 保存较早轮次的稳定决定，conversation_history 只包含最近窗口；二者冲突时以最近的用户明确指令为准。"
             "用户要求分析附件时，回答必须具体引用文件名及附件中的实际内容；附件无可读文本时必须明确说明，不能假装已经阅读。\n\n"
+            "项目检索必须遵守 context.goal_spec 的硬约束，并按 plan 的 Recipe 执行。"
+            "搜索结果必须先通过项目身份校验，再读取官网并取得逐字证据；未核验项目不得作为最终推荐发布。\n\n"
             f"当前 Skill：{skill.name} v{skill.version}\n{skill.instructions}\n{skill.prompt}\n\n"
             "最终响应必须只返回一个符合以下 JSON Schema 的 JSON 对象，不要 Markdown。"
             "所有面向用户的简要说明写入 summary 字段：\n"
@@ -262,8 +304,11 @@ class OpenAIResponsesProvider:
                         result = await tools.execute(
                             session, run_id, call.name, arguments, allowed_names,
                             approved=user_confirmed_write,
+                            goal_spec=goal_spec,
                         )
-                        if result in (None, [], {}):
+                        if isinstance(result, dict) and result.get("error"):
+                            error_type = str(result["error"])
+                        elif result in (None, [], {}):
                             error_type = "no_result"
                             result = {
                                 "error": error_type,
@@ -274,7 +319,9 @@ class OpenAIResponsesProvider:
                                 "tool.completed",
                                 {"run_id": run_id, "tool": call.name, "call": tool_call_count},
                             )
-                        if not error_type and call.name in {"search_programs", "mcp_catalog_search"}:
+                        if not error_type and call.name in {
+                            "discover_official_programs", "search_programs", "mcp_catalog_search"
+                        }:
                             for item in result if isinstance(result, list) else []:
                                 if item.get("id"):
                                     grounded_programs[item["id"]] = item
@@ -452,6 +499,34 @@ class DashScopeChatProvider:
         }
         return result
 
+    async def verify_material(
+        self, payload: Dict[str, Any], candidate: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not self.client:
+            from app.agent.verifier import local_material_verification
+
+            return local_material_verification(payload, candidate)
+        response = await asyncio.to_thread(
+            self.client.chat.completions.create,
+            model=settings.dashscope_extraction_model,
+            messages=[
+                {"role": "system", "content": material_verification_instructions()},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"context": payload, "candidate": candidate},
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content or "{}"
+        result = MaterialVerificationReport.model_validate(json.loads(raw)).model_dump()
+        result["mode"] = "dashscope-independent-verifier"
+        return result
+
     async def run(
         self,
         session: AsyncSession,
@@ -461,6 +536,7 @@ class DashScopeChatProvider:
         skill: Skill,
         tools: ToolRegistry,
         emit: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+        goal_spec: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         if not self.client:
             return OpenAIResponsesProvider._local_response(message, context, skill), {
@@ -487,8 +563,11 @@ class DashScopeChatProvider:
         instructions = (
             "你是 YYGlobal 留学申请 Agent。只使用上下文中的已确认事实；不确定时明确说明。"
             "种子项目数据必须提示申请前核验官网。不得编造经历、成绩、截止日期或录取概率。\n\n"
-            "必须阅读结构化上下文中的 conversation_history、reference_documents 和 reference_drafts。"
+            "必须阅读结构化上下文中的 conversation_memory、conversation_history、reference_documents 和 reference_drafts。"
+            "conversation_memory.stable_summary 和 decisions 保存较早轮次的稳定决定，conversation_history 只包含最近窗口；二者冲突时以最近的用户明确指令为准。"
             "用户要求分析附件时，回答必须具体引用文件名及附件中的实际内容；附件无可读文本时必须明确说明，不能假装已经阅读。\n\n"
+            "项目检索必须遵守 context.goal_spec 的硬约束，并按 plan 的 Recipe 执行。"
+            "搜索结果必须先通过项目身份校验，再读取官网并取得逐字证据；未核验项目不得作为最终推荐发布。\n\n"
             f"当前 Skill：{skill.name} v{skill.version}\n{skill.instructions}\n{skill.prompt}\n\n"
             "最终响应必须只返回一个符合以下 JSON Schema 的 JSON 对象，不要 Markdown。"
             "所有面向用户的简要说明写入 summary 字段：\n"
@@ -581,8 +660,11 @@ class DashScopeChatProvider:
                             arguments,
                             allowed_names,
                             approved=user_confirmed_write,
+                            goal_spec=goal_spec,
                         )
-                        if result in (None, [], {}):
+                        if isinstance(result, dict) and result.get("error"):
+                            error_type = str(result["error"])
+                        elif result in (None, [], {}):
                             error_type = "no_result"
                             result = {
                                 "error": error_type,
@@ -597,7 +679,9 @@ class DashScopeChatProvider:
                                     "call": tool_call_count,
                                 },
                             )
-                        if not error_type and call.function.name in {"search_programs", "mcp_catalog_search"}:
+                        if not error_type and call.function.name in {
+                            "discover_official_programs", "search_programs", "mcp_catalog_search"
+                        }:
                             for item in result if isinstance(result, list) else []:
                                 if item.get("id"):
                                     grounded_programs[item["id"]] = item
@@ -703,6 +787,28 @@ class ProviderRouter:
             return local_material_response(payload)
         return await self._active().generate_material(payload)
 
+    async def verify_material(
+        self, payload: Dict[str, Any], candidate: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not self.available:
+            from app.agent.verifier import local_material_verification
+
+            return local_material_verification(payload, candidate)
+        return await self._active().verify_material(payload, candidate)
+
+
+def material_verification_instructions() -> str:
+    return (
+        "你是独立于写作模型的申请材料验证器。只能根据输入 context 中的 Context Manifest、"
+        "官网要求、已确认画像、经历、文件、历史文稿和对话检查 candidate，不得补充常识。"
+        "逐项检查：是否覆盖官网题目要求；是否出现上下文没有支持的经历、数字、身份、课程、教授或成果；"
+        "是否与来源冲突；source_experience_ids 是否真实支持正文。"
+        "轻微且可修订的问题返回 revise，事实虚构、来源冲突或关键要求缺失返回 rejected，全部通过才返回 accepted。"
+        "issues 使用稳定的英文短代码，unsupported_claims 和 conflicts 列出具体片段。"
+        "严格返回符合 JSON Schema 的 JSON 对象，不要 Markdown：\n"
+        + json.dumps(MaterialVerificationReport.model_json_schema(), ensure_ascii=False)
+    )
+
 
 def material_generation_instructions(
     payload: Dict[str, Any], assistant_mode: bool = False
@@ -727,7 +833,12 @@ def material_generation_instructions(
         "你是严谨的留学申请材料写作助手。只允许使用输入 JSON 中明确提供的信息。申请人的事实必须来自"
         "profile、confirmed_experiences、memories、reference_documents 或 reference_drafts。"
         "不得发明姓名、经历、职责、技术、成果数字、奖项、课程、教授或项目要求。"
-        "每一轮都必须继承 conversation_history 中已经确定的写作目标、取舍和修改要求；"
+        "每一轮都必须继承 conversation_memory 中的稳定摘要和已确认决定，以及 conversation_history 中的最近修改要求；"
+        "若两者冲突，以最近的用户明确指令为准。"
+        "context_manifest 是本轮实际加载资源的权威清单；只能引用清单中存在且已加载的画像、经历、文件、历史文稿、当前文稿和官网证据。"
+        "若清单中的资源缺失或不可读，必须明确说明，不得假装已经参考。"
+        "如果输入包含 verification_feedback 和 revision_instruction，必须逐项修正验证问题，"
+        "但仍不得引入 Context Manifest 之外的新事实或来源。"
         "修改已有文稿时必须以 current_draft.content 为直接底稿，不得退回更早版本。"
         "必须优先遵守 official_requirements.exact_requirement，并结合其中与当前材料相关的官网原文 evidence 回答当前材料题目；"
         "all_material_requirements 和 general_evidence 只用于理解完整申请要求，不得误当成当前文稿题目。"

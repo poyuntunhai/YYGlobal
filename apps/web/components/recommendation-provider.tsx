@@ -1,8 +1,8 @@
 "use client";
 
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { createContext, useContext, useEffect, useRef, useState } from "react";
-import { api, Profile, ProgramRecommendation } from "@/lib/api";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createContext, useContext, useEffect, useState } from "react";
+import { api, Profile, ProgramRecommendation, RecommendationGoal, RecommendationGoalInput } from "@/lib/api";
 
 const STORAGE_KEY = "yyglobal-program-recommendations-v1";
 
@@ -23,6 +23,7 @@ type BatchRequest = {
 
 type RecommendationContextValue = {
   profile?: Profile;
+  goal?: RecommendationGoal;
   profileReady: boolean;
   input: string;
   setInput: (value: string) => void;
@@ -34,17 +35,46 @@ type RecommendationContextValue = {
   recommendationNotice: string;
   isPending: boolean;
   error: Error | null;
-  profileChoiceOpen: boolean;
   requestBatch: (replace: boolean, query?: string) => void;
-  restartForChangedProfile: () => void;
-  appendForChangedProfile: () => void;
-  dismissProfileChoice: () => void;
+  saveGoalAndAppend: (goal: RecommendationGoalInput) => Promise<void>;
+  clearResults: () => void;
 };
 
 const RecommendationContext = createContext<RecommendationContextValue | null>(null);
 
+function recommendationProfileVersion(profile?: Profile, goal?: RecommendationGoal) {
+  if (!profile || !goal) return "";
+  return JSON.stringify({
+    current_major: profile.current_major,
+    degree: profile.degree,
+    gpa: profile.gpa,
+    gpa_scale: profile.gpa_scale,
+    language_scores: profile.language_scores,
+    preferences: profile.preferences,
+    confirmed: profile.confirmed,
+    experiences: profile.experiences.map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      title: item.title,
+      organization: item.organization,
+      description: item.description,
+      tags: item.tags,
+      confirmed: item.confirmed,
+    })),
+    goal: {
+      target_countries: goal.target_countries,
+      target_fields: goal.target_fields,
+      target_university: goal.target_university,
+      target_degree_level: goal.target_degree_level,
+      intake: goal.intake,
+      budget: goal.budget,
+      max_qs_rank: goal.max_qs_rank,
+    },
+  });
+}
+
 export function RecommendationProvider({ children }: { children: React.ReactNode }) {
-  const initialRequestStarted = useRef(false);
+  const client = useQueryClient();
   const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState("");
   const [queryText, setQueryText] = useState("");
@@ -53,11 +83,16 @@ export function RecommendationProvider({ children }: { children: React.ReactNode
   const [sessionProfileVersion, setSessionProfileVersion] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [recommendationNotice, setRecommendationNotice] = useState("");
-  const [profileChoiceOpen, setProfileChoiceOpen] = useState(false);
-  const [dismissedProfileVersion, setDismissedProfileVersion] = useState("");
   const profileQuery = useQuery({ queryKey: ["profile"], queryFn: api.profile });
+  const goalQuery = useQuery({ queryKey: ["recommendation-goal"], queryFn: api.recommendationGoal });
   const profile = profileQuery.data;
-  const profileReady = Boolean(profile?.confirmed && profile.target_fields.length && profile.target_countries.length);
+  const goal = goalQuery.data;
+  const currentProfileVersion = recommendationProfileVersion(profile, goal);
+  const profileReady = Boolean(
+    profile?.confirmed
+    && goal?.target_fields.length
+    && (goal?.target_countries.length || goal?.target_university),
+  );
 
   const fetchBatch = useMutation({
     mutationFn: (request: BatchRequest) => api.programRecommendations(request.query, request.excludedIds),
@@ -69,7 +104,11 @@ export function RecommendationProvider({ children }: { children: React.ReactNode
       setSessionProfileVersion(request.profileVersion);
       setQueryText(request.query);
       setInput(request.query);
-      setRecommendationNotice(batch.length === 5 ? `已在页面顶部新增 ${batch.length} 个项目。` : batch.length ? `已新增 ${batch.length} 个项目，当前条件下没有更多项目了。` : "当前条件下暂时没有更多未展示的项目。");
+      setRecommendationNotice(batch.length === 5
+        ? `已联网发现并完成官网核验，在页面顶部新增 ${batch.length} 个项目。`
+        : batch.length
+          ? `本次联网搜索新增 ${batch.length} 个通过官网核验的项目。`
+          : "本次已联网搜索，但没有发现新的、同时满足条件并通过官网证据核验的项目。可调整学校、QS、国家或专业方向后重试。");
     },
     onError: (error) => setRecommendationNotice(error instanceof Error ? error.message : "推荐失败"),
   });
@@ -103,57 +142,49 @@ export function RecommendationProvider({ children }: { children: React.ReactNode
     } satisfies StoredSession));
   }, [hydrated, items, latestBatchIds, queryText, selected, sessionProfileVersion]);
 
-  useEffect(() => {
-    const currentVersion = profile?.updated_at;
-    if (!hydrated || !currentVersion || !items.length || !sessionProfileVersion) return;
-    if (currentVersion !== sessionProfileVersion && currentVersion !== dismissedProfileVersion) setProfileChoiceOpen(true);
-  }, [dismissedProfileVersion, hydrated, items.length, profile?.updated_at, sessionProfileVersion]);
-
-  useEffect(() => {
-    if (!hydrated || !profileReady || items.length || initialRequestStarted.current || !profile?.updated_at) return;
-    initialRequestStarted.current = true;
-    fetchBatch.mutate({ query: "", excludedIds: [], profileVersion: profile.updated_at, replace: true });
-  }, [fetchBatch, hydrated, items.length, profile?.updated_at, profileReady]);
-
   const requestBatch = (replace: boolean, query = queryText) => {
-    const profileVersion = profile?.updated_at ?? sessionProfileVersion;
+    const profileVersion = currentProfileVersion || sessionProfileVersion;
     if (!profileVersion || fetchBatch.isPending) return;
-    initialRequestStarted.current = true;
     fetchBatch.mutate({ query, excludedIds: replace ? [] : items.map((item) => item.program.id), profileVersion, replace });
   };
 
-  const restartForChangedProfile = () => {
-    if (!profile?.updated_at || fetchBatch.isPending) return;
-    initialRequestStarted.current = true;
-    setProfileChoiceOpen(false);
-    setDismissedProfileVersion(profile.updated_at);
+  const saveGoalAndAppend = async (values: RecommendationGoalInput) => {
+    if (fetchBatch.isPending) return;
+    setRecommendationNotice("");
+    try {
+      const saved = await api.saveRecommendationGoal(values);
+      client.setQueryData(["recommendation-goal"], saved);
+      client.invalidateQueries({ queryKey: ["profile"] });
+      const profileVersion = recommendationProfileVersion(profile, saved);
+      if (!profileVersion) return;
+      setSelected([]);
+      fetchBatch.mutate({
+        query: "",
+        excludedIds: items.map((item) => item.program.id),
+        profileVersion,
+        replace: false,
+      });
+    } catch (error) {
+      setRecommendationNotice(error instanceof Error ? error.message : "选校目标保存失败");
+    }
+  };
+
+  const clearResults = () => {
+    if (fetchBatch.isPending) return;
     setItems([]);
     setLatestBatchIds([]);
     setSelected([]);
     setQueryText("");
     setInput("");
-    fetchBatch.mutate({ query: "", excludedIds: [], profileVersion: profile.updated_at, replace: true });
-  };
-
-  const appendForChangedProfile = () => {
-    if (!profile?.updated_at || fetchBatch.isPending) return;
-    initialRequestStarted.current = true;
-    setProfileChoiceOpen(false);
-    setDismissedProfileVersion(profile.updated_at);
-    fetchBatch.mutate({ query: "", excludedIds: items.map((item) => item.program.id), profileVersion: profile.updated_at, replace: false });
-  };
-
-  const dismissProfileChoice = () => {
-    if (profile?.updated_at) setDismissedProfileVersion(profile.updated_at);
-    setProfileChoiceOpen(false);
+    setSessionProfileVersion(currentProfileVersion);
+    setRecommendationNotice("已清空全部推荐结果。调整条件后可继续推荐 5 个项目。");
   };
 
   return <RecommendationContext.Provider value={{
-    profile, profileReady, input, setInput, queryText, items, latestBatchIds,
+    profile, goal, profileReady, input, setInput, queryText, items, latestBatchIds,
     selected, setSelected, recommendationNotice, isPending: fetchBatch.isPending,
     error: fetchBatch.error instanceof Error ? fetchBatch.error : null,
-    profileChoiceOpen, requestBatch, restartForChangedProfile,
-    appendForChangedProfile, dismissProfileChoice,
+    requestBatch, saveGoalAndAppend, clearResults,
   }}>{children}</RecommendationContext.Provider>;
 }
 

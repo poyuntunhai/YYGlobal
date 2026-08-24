@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,13 +12,27 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.conversation_memory import build_conversation_memory
+from app.agent.goals import parse_material_goal
 from app.agent.guardrails import check_user_input, verify_output
 from app.agent.harness import harness
+from app.agent.material_context import (
+    build_context_manifest_data,
+    content_hash,
+    validate_context_manifest,
+)
+from app.agent.material_workflow import (
+    set_material_step,
+    start_material_run,
+    sync_material_plan,
+)
 from app.agent.mcp import demo_mcp
 from app.agent.memory import persist_confirmed_memory
+from app.agent.program_recommendation_workflow import run_online_program_recommendation
 from app.agent.provider import provider
 from app.agent.skills import skill_registry
 from app.agent.tools import tool_registry
+from app.agent.verifier import verify_material_candidate
 from app.core.config import settings
 from app.core.database import get_session
 from app.models.entities import (
@@ -26,6 +41,7 @@ from app.models.entities import (
     ApplicantProfile,
     Application,
     ApplicationPackage,
+    ContextManifest,
     Conversation,
     Document,
     EvidenceChunk,
@@ -38,6 +54,7 @@ from app.models.entities import (
     Message,
     Program,
     ProgramSource,
+    RecommendationGoal,
     Shortlist,
     ShortlistItem,
     Task,
@@ -45,15 +62,16 @@ from app.models.entities import (
 )
 from app.schemas.api import (
     AgentRunResponse,
-    AssistantConversationCreate,
-    AssistantConversationUpdate,
-    AssistantConversationResponse,
     ApplicationCreate,
     ApplicationPackageResponse,
     ApplicationResponse,
     ApplicationUpdate,
+    AssistantConversationCreate,
+    AssistantConversationResponse,
+    AssistantConversationUpdate,
     BatchVerifyResponse,
     ChatRequest,
+    ContextManifestResponse,
     DocumentConfirmRequest,
     DocumentResponse,
     EvidenceResponse,
@@ -77,6 +95,8 @@ from app.schemas.api import (
     ProgramRecommendationResponse,
     ProgramResponse,
     ProgramVerifyResponse,
+    RecommendationGoalResponse,
+    RecommendationGoalUpdate,
     RequirementResponse,
     ShortlistCreate,
     ShortlistItemResponse,
@@ -89,6 +109,7 @@ from app.schemas.api import (
     TaskUpdate,
     TimelineCreate,
     TraceResponse,
+    UniversityOptionResponse,
     WritingConversationCreate,
     WritingConversationResponse,
     WritingConversationUpdate,
@@ -103,15 +124,18 @@ from app.services.business import (
     create_task,
     create_timeline,
     get_or_create_application_package,
+    get_or_create_recommendation_goal,
     get_program,
     get_requirement,
     material_slots,
     profile_with_experiences,
-    recommendation_candidates,
+    refresh_application_package,
     remove_shortlist_program,
     score_recommendation,
     search_programs_for_profile,
+    university_options,
     update_profile,
+    update_recommendation_goal,
 )
 from app.services.documents import (
     SUPPORTED_MIME_TYPES,
@@ -119,8 +143,6 @@ from app.services.documents import (
     infer_document_data,
     sha256_bytes,
 )
-
-
 from app.services.material_exports import (
     content_disposition,
     docx_export,
@@ -132,6 +154,7 @@ from app.services.web import UnsafeUrlError
 
 router = APIRouter()
 active_writing_tasks: Dict[str, asyncio.Task] = {}
+active_chat_tasks: Dict[str, asyncio.Task] = {}
 
 
 def profile_response(profile: Any, experiences: List[Any]) -> ProfileResponse:
@@ -209,6 +232,30 @@ async def put_profile_route(
             source_id=profile.id,
         )
     return profile_response(profile, experiences)
+
+
+@router.get("/recommendation-goal", response_model=RecommendationGoalResponse)
+async def get_recommendation_goal(
+    session: AsyncSession = Depends(get_session),
+) -> RecommendationGoalResponse:
+    goal = await get_or_create_recommendation_goal(session)
+    return RecommendationGoalResponse.model_validate(goal)
+
+
+@router.put("/recommendation-goal", response_model=RecommendationGoalResponse)
+async def put_recommendation_goal(
+    payload: RecommendationGoalUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> RecommendationGoalResponse:
+    goal = await update_recommendation_goal(session, payload)
+    await persist_confirmed_memory(
+        session,
+        key="recommendation_goal",
+        value=payload.model_dump(),
+        source_type="user_confirmed",
+        source_id=goal.id,
+    )
+    return RecommendationGoalResponse.model_validate(goal)
 
 
 @router.get("/profile/export")
@@ -295,6 +342,7 @@ async def clear_profile(
         Shortlist,
         Experience,
         Document,
+        RecommendationGoal,
         ApplicantProfile,
     ):
         await session.execute(delete(model).where(model.owner_id == settings.local_owner_id))
@@ -481,6 +529,18 @@ async def list_programs(
     return [await serialize_program(session, item) for item in items]
 
 
+@router.get("/programs/universities", response_model=List[UniversityOptionResponse])
+async def list_university_options(
+    countries: List[str] = Query(default_factory=list),
+    max_qs_rank: Optional[int] = Query(None, ge=1, le=300),
+    session: AsyncSession = Depends(get_session),
+) -> List[UniversityOptionResponse]:
+    return [
+        UniversityOptionResponse(**item)
+        for item in await university_options(session, countries, max_qs_rank)
+    ]
+
+
 @router.post(
     "/programs/recommendations",
     response_model=List[ProgramRecommendationResponse],
@@ -492,38 +552,41 @@ async def recommend_programs(
     session: AsyncSession = Depends(get_session),
 ) -> List[ProgramRecommendationResponse]:
     profile, _ = await profile_with_experiences(session)
+    goal = await get_or_create_recommendation_goal(session)
     if not q and (
-        not profile.confirmed or not profile.target_fields or not profile.target_countries
+        not profile.confirmed
+        or not goal.target_fields
+        or (not goal.target_countries and not goal.target_university)
     ):
         raise HTTPException(400, "请先完成画像，再开始项目推荐")
 
     excluded_program_ids = {
         item.strip() for item in exclude_ids.split(",") if item.strip()
     }
-    ranked = await recommendation_candidates(
-        session,
-        query=q,
-        limit=limit,
-        excluded_program_ids=excluded_program_ids,
-    )
+    try:
+        programs, _ = await run_online_program_recommendation(
+            session, goal, excluded_program_ids=excluded_program_ids, limit=limit
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            504,
+            "官网目录定位超时，本次不会重复执行完整检索，请稍后重试。",
+        ) from exc
     output = []
-    for program, _, _ in ranked:
-        try:
-            await verify_program_official(session, program)
-        except Exception:
-            # The program remains visible with its direct official URL. Existing
-            # evidence is preserved and a later recommendation run can refresh it.
-            pass
+    refreshed_profile, experiences = await profile_with_experiences(session)
+    refreshed_goal = await get_or_create_recommendation_goal(session)
+    for program in programs:
         requirement = await get_requirement(session, program.id)
-        refreshed_profile, experiences = await profile_with_experiences(session)
         score, reasons = await score_recommendation(
-            refreshed_profile, experiences, program, requirement
+            refreshed_profile, experiences, program, requirement, refreshed_goal
         )
         output.append(
             ProgramRecommendationResponse(
                 program=await serialize_program(session, program),
                 score=score,
                 reasons=reasons,
+                verification_status="verified",
+                verification_error="",
             )
         )
     output.sort(key=lambda item: (-item.score, item.program.university, item.program.name))
@@ -568,8 +631,9 @@ async def verify_profile_matched_programs(
     session: AsyncSession = Depends(get_session),
 ) -> BatchVerifyResponse:
     profile, _ = await profile_with_experiences(session)
-    if not profile.confirmed or not profile.target_fields or not profile.target_countries:
-        raise HTTPException(400, "请先确认画像，并填写目标国家和目标专业方向")
+    goal = await get_or_create_recommendation_goal(session)
+    if not profile.confirmed or not goal.target_fields or not goal.target_countries:
+        raise HTTPException(400, "请先确认画像，并在项目推荐中填写选校目标")
     matched = await search_programs_for_profile(session, use_profile=True)
     results: List[Dict[str, Any]] = []
     for program in matched[:limit]:
@@ -748,6 +812,7 @@ async def update_package_material(
     allowed = {"ready", "needs_edit", "unverified", "missing", "manual_review"}
     if payload.status not in allowed:
         raise HTTPException(422, "不支持的材料适配状态")
+    await refresh_application_package(session, item)
     # Rebuild every JSON row so SQLAlchemy reliably persists nested changes.
     checklist = [dict(row) for row in (item.checklist or [])]
     target = next(
@@ -757,13 +822,19 @@ async def update_package_material(
         raise HTTPException(404, "申请包中没有该材料要求")
     candidates = target.get("candidate_assets", [])
     if payload.status == "ready":
-        valid = any(
-            row.get("type") == payload.selected_asset_type
-            and row.get("id") == payload.selected_asset_id
+        selected = next((
+            row
             for row in candidates
-        )
+            if row.get("type") == payload.selected_asset_type
+            and row.get("id") == payload.selected_asset_id
+        ), None)
+        valid = selected is not None
+        if selected and selected.get("type") == "draft":
+            valid = selected.get("status") == "reviewed"
+        if selected and selected.get("type") == "artifact":
+            valid = selected.get("status") in {"ready", "submitted"}
         if not valid:
-            raise HTTPException(422, "标记符合要求时必须选择一个实际存在的材料版本")
+            raise HTTPException(422, "所选材料不存在、尚未确认，或不属于当前项目")
     target.update({
         "status": payload.status,
         "selected_asset_type": payload.selected_asset_type,
@@ -777,6 +848,41 @@ async def update_package_material(
     item.gaps = [
         f"待处理：{row.get('name')}" for row in checklist if row.get("status") != "ready"
     ]
+    if payload.status == "ready" and payload.selected_asset_type == "draft":
+        selected_draft = await session.get(MaterialDraft, payload.selected_asset_id)
+        if selected_draft and selected_draft.owner_id == settings.local_owner_id:
+            run_id = str((selected_draft.model_info or {}).get("agent_run_id") or "")
+            if run_id:
+                run = await session.get(AgentRun, run_id)
+                run_steps = list(
+                    (
+                        await session.scalars(
+                            select(AgentStep)
+                            .where(AgentStep.run_id == run_id)
+                            .order_by(AgentStep.position)
+                        )
+                    ).all()
+                )
+                if run and run_steps:
+                    set_material_step(
+                        run_steps,
+                        "adopt_version",
+                        "accepted",
+                        {
+                            "draft_id": selected_draft.id,
+                            "package_id": item.id,
+                            "material_key": payload.material_key,
+                            "confirmed_by_user": True,
+                        },
+                    )
+                    sync_material_plan(run, run_steps)
+                    run.stop_reason = "adopted"
+            if selected_draft.context_manifest_id:
+                manifest = await session.get(
+                    ContextManifest, selected_draft.context_manifest_id
+                )
+                if manifest:
+                    manifest.status = "adopted"
     await session.commit()
     await session.refresh(item)
     return await serialize_application_package(session, item)
@@ -793,10 +899,17 @@ async def confirm_package_plan(
     item = await session.get(ApplicationPackage, package_id)
     if not item or item.owner_id != settings.local_owner_id:
         raise HTTPException(404, "项目申请包不存在")
+    await refresh_application_package(session, item)
     checklist = [dict(row) for row in (item.checklist or [])]
-    unresolved = [row.get("name") for row in checklist if not row.get("selected_asset_id")]
+    if not checklist:
+        raise HTTPException(422, "当前项目还没有可确认的官网材料清单")
+    unresolved = [
+        row.get("name")
+        for row in checklist
+        if row.get("status") != "ready" or not row.get("selected_asset_id")
+    ]
     if unresolved:
-        raise HTTPException(422, f"仍有材料没有当前方案：{'、'.join(str(value) for value in unresolved[:6])}")
+        raise HTTPException(422, f"仍有材料没有完成准备：{'、'.join(str(value) for value in unresolved[:6])}")
     item.plan_confirmed = True
     item.ready = True
     item.status = "ready"
@@ -1058,7 +1171,10 @@ async def generate_material_draft(
     if check_user_input(payload.prompt):
         raise HTTPException(400, "附加题目包含不安全的指令内容")
     profile, experiences = await profile_with_experiences(session)
-    selected_resources = set(conversation.resource_ids or [])
+    # This legacy one-shot endpoint has no conversation. It always uses the
+    # confirmed profile and confirmed experiences; conversational resource
+    # selection is handled by /writing-conversations/{id}/messages.
+    selected_resources = {"profile", "confirmed_experiences"}
     confirmed_all = [item for item in experiences if item.confirmed]
     selected_experience_ids = {
         value.removeprefix("experience:")
@@ -1224,6 +1340,8 @@ async def update_material_draft(
         source_experience_ids=item.source_experience_ids,
         warnings=item.warnings,
         model_info={**item.model_info, "edited_from": item.id},
+        context_manifest_id=item.context_manifest_id,
+        source_refs=item.source_refs,
         status=str(values.get("status", item.status)),
     )
     session.add(new_item)
@@ -1263,12 +1381,27 @@ async def restore_material_draft(
         source_experience_ids=item.source_experience_ids,
         warnings=item.warnings,
         model_info={**item.model_info, "restored_from": item.id},
+        context_manifest_id=item.context_manifest_id,
+        source_refs=item.source_refs,
         status="draft",
     )
     session.add(restored)
     await session.commit()
     await session.refresh(restored)
     return restored
+
+
+@router.get(
+    "/context-manifests/{manifest_id}", response_model=ContextManifestResponse
+)
+async def get_context_manifest(
+    manifest_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> ContextManifest:
+    item = await session.get(ContextManifest, manifest_id)
+    if not item or item.owner_id != settings.local_owner_id:
+        raise HTTPException(404, "上下文清单不存在")
+    return item
 
 
 async def serialize_writing_conversation(
@@ -1298,6 +1431,7 @@ async def serialize_writing_conversation(
         slot_key=conversation.slot_key,
         material_kind=conversation.material_kind,
         resource_ids=conversation.resource_ids,
+        memory_state=conversation.memory_state,
         messages=[WritingMessageResponse.model_validate(item) for item in messages],
         latest_draft=(MaterialDraftResponse.model_validate(latest_draft) if latest_draft else None),
         created_at=conversation.created_at,
@@ -1355,6 +1489,7 @@ async def list_assistant_conversations(
             material_kind=item.material_kind,
             pinned=item.pinned,
             resource_ids=item.resource_ids,
+            memory_state=item.memory_state,
             messages=[WritingMessageResponse.model_validate(message) for message in messages],
             created_at=item.created_at,
             updated_at=item.updated_at,
@@ -1380,6 +1515,7 @@ async def create_assistant_conversation(
         title=item.title,
         scene="application",
         resource_ids=item.resource_ids,
+        memory_state=item.memory_state,
         messages=[],
         created_at=item.created_at,
         updated_at=item.updated_at,
@@ -1423,6 +1559,7 @@ async def update_assistant_conversation(
         material_kind=item.material_kind,
         pinned=item.pinned,
         resource_ids=item.resource_ids,
+        memory_state=item.memory_state,
         messages=[WritingMessageResponse.model_validate(message) for message in messages],
         created_at=item.created_at,
         updated_at=item.updated_at,
@@ -1636,6 +1773,8 @@ async def _generate_writing_reply(
             if term not in {"the", "and", "for", "with", "your", "申请", "材料"}
         }
         evidence_payload = [{
+            "evidence_id": item.id,
+            "source_id": item.source_id,
             "quote": item.quote,
             "locator": item.locator,
             "url": source_urls.get(item.source_id, program.official_url),
@@ -1668,10 +1807,6 @@ async def _generate_writing_reply(
         ],
     )
     session.add(user_message)
-    conversation.resource_ids = [
-        value for value in conversation.resource_ids
-        if not value.startswith(("document:", "draft:"))
-    ]
     await session.flush()
     history = list((await session.scalars(
         select(Message).where(Message.conversation_id == conversation.id).order_by(Message.created_at)
@@ -1685,16 +1820,111 @@ async def _generate_writing_reply(
         item for item in conversation_drafts
         if item.model_info.get("conversation_id") == conversation.id
     ), None)
+    resource_snapshots = [
+        *[
+            {
+                "resource_id": f"document:{item.id}",
+                "label": item.filename,
+                "kind": item.kind,
+                "readable": bool(
+                    (item.extracted_text or "").strip()
+                    or str((item.extracted_data or {}).get("summary") or "").strip()
+                ),
+                "content_hash": content_hash(
+                    item.extracted_text
+                    or str((item.extracted_data or {}).get("summary") or "")
+                ),
+            }
+            for item in reference_documents
+        ],
+        *[
+            {
+                "resource_id": f"draft:{item.id}",
+                "label": item.title,
+                "kind": item.kind,
+                "readable": bool(item.content.strip()),
+                "content_hash": content_hash(item.content),
+            }
+            for item in reference_drafts
+        ],
+    ]
+    if "profile" in selected_resources:
+        resource_snapshots.append({
+            "resource_id": "profile",
+            "label": "已确认画像",
+            "kind": "profile",
+            "readable": bool(profile.confirmed),
+            "content_hash": content_hash({
+                "id": profile.id,
+                "updated_at": profile.updated_at.isoformat(),
+                "confirmed": profile.confirmed,
+            }),
+        })
+    if "confirmed_experiences" in selected_resources:
+        resource_snapshots.append({
+            "resource_id": "confirmed_experiences",
+            "label": "已确认经历",
+            "kind": "experiences",
+            "readable": bool(confirmed),
+            "content_hash": content_hash([
+                {"id": item.id, "updated_at": item.updated_at.isoformat()}
+                for item in confirmed
+            ]),
+        })
+    resource_snapshots.extend({
+        "resource_id": f"experience:{item.id}",
+        "label": item.title,
+        "kind": "experience",
+        "readable": True,
+        "content_hash": content_hash({
+            "id": item.id,
+            "updated_at": item.updated_at.isoformat(),
+            "description": item.description,
+        }),
+    } for item in confirmed)
+    if "official_requirements" in selected_resources:
+        resource_snapshots.append({
+            "resource_id": "official_requirements",
+            "label": "官网要求与原文证据",
+            "kind": "official_requirements",
+            "readable": bool(official_context.get("evidence")),
+            "content_hash": content_hash(official_context),
+        })
+    if "historical_drafts" in selected_resources:
+        resource_snapshots.append({
+            "resource_id": "historical_drafts",
+            "label": "历史文稿",
+            "kind": "draft_collection",
+            "readable": bool(reference_drafts),
+            "content_hash": content_hash([
+                {"id": item.id, "updated_at": item.updated_at.isoformat()}
+                for item in reference_drafts
+            ]),
+        })
+    conversation_memory, recent_history = build_conversation_memory(
+        history,
+        conversation.memory_state or {},
+        selected_resources,
+        resource_snapshots,
+    )
+    conversation.memory_state = conversation_memory
     generation_input = {
         "interaction_mode": "assistant",
         "kind": conversation.material_kind,
         "language": "English",
         "prompt": payload.message,
-        "conversation_history": [{"role": item.role, "content": item.content} for item in history],
+        "conversation_history": [
+            {"role": item["role"], "content": item["content"]}
+            for item in recent_history
+        ],
+        "conversation_memory": conversation_memory,
         "resource_ids": conversation.resource_ids,
         "slot_key": conversation.slot_key,
         "official_requirements": official_context,
         "profile": ({
+            "id": profile.id,
+            "updated_at": profile.updated_at.isoformat(),
+            "confirmed": profile.confirmed,
             "full_name": profile.full_name,
             "current_school": profile.current_school,
             "current_major": profile.current_major,
@@ -1744,11 +1974,135 @@ async def _generate_writing_reply(
             "field": program.field, "official_url": program.official_url,
         },
     }
+    goal_spec = parse_material_goal(
+        payload.message,
+        conversation.material_kind,
+        program.id,
+        conversation.slot_key,
+        bool(current_draft),
+    )
+    run, run_steps = await start_material_run(
+        session, conversation, payload.message, goal_spec
+    )
+    set_material_step(
+        run_steps,
+        "resolve_writing_intent",
+        "accepted",
+        {"goal_spec": goal_spec},
+    )
+    manifest_data = build_context_manifest_data(
+        goal_spec=goal_spec,
+        profile=generation_input["profile"],
+        conversation_id=conversation.id,
+        history=generation_input["conversation_history"],
+        conversation_memory=conversation_memory,
+        program=generation_input["program"],
+        material_kind=conversation.material_kind,
+        slot_key=conversation.slot_key,
+        selected_resource_ids=selected_resources,
+        experiences=[{**item, "confirmed": True} for item in generation_input["confirmed_experiences"]],
+        documents=generation_input["reference_documents"],
+        drafts=generation_input["reference_drafts"],
+        official_context=official_context,
+        current_draft=generation_input["current_draft"],
+    )
+    completeness = validate_context_manifest(manifest_data, goal_spec)
+    manifest = ContextManifest(
+        owner_id=settings.local_owner_id,
+        agent_run_id=run.id,
+        conversation_id=conversation.id,
+        program_id=program.id,
+        material_kind=conversation.material_kind,
+        slot_key=conversation.slot_key,
+        intent=goal_spec["intent"],
+        profile_ref=manifest_data["profile_ref"],
+        conversation_ref=manifest_data["conversation_ref"],
+        experience_refs=manifest_data["experience_refs"],
+        document_refs=manifest_data["document_refs"],
+        draft_refs=manifest_data["draft_refs"],
+        official_evidence_refs=manifest_data["official_evidence_refs"],
+        current_draft_ref=manifest_data["current_draft_ref"],
+        content_hashes=manifest_data["content_hashes"],
+        completeness=completeness,
+        status="accepted" if completeness["verdict"] == "accepted" else "partial",
+    )
+    session.add(manifest)
+    await session.flush()
+    generation_input["context_manifest"] = {
+        **manifest_data,
+        "id": manifest.id,
+        "completeness": completeness,
+    }
+    run.context_snapshot = {
+        "goal_spec": goal_spec,
+        "context_manifest_id": manifest.id,
+        "context_manifest_hash": manifest.content_hashes.get("manifest"),
+    }
+    context_accepted = completeness["verdict"] == "accepted" or goal_spec["intent"] == "chat"
+    set_material_step(
+        run_steps,
+        "resolve_material_context",
+        "accepted" if context_accepted else "rejected",
+        {"manifest_id": manifest.id, "completeness": completeness},
+    )
+    if not context_accepted:
+        for step_type in (
+            "generate_or_edit_draft",
+            "validate_draft",
+            "independent_verify_draft",
+            "present_candidate_version",
+            "adopt_version",
+        ):
+            set_material_step(
+                run_steps, step_type, "blocked", {"reason": "context_incomplete"}
+            )
+        run.status = "failed"
+        run.stop_reason = "context_incomplete"
+        run.final_output = "生成前上下文不完整"
+        sync_material_plan(run, run_steps)
+        await session.commit()
+        raise HTTPException(
+            422,
+            f"生成前上下文不完整：{', '.join(completeness['issues'])}",
+        )
+    set_material_step(
+        run_steps,
+        "generate_or_edit_draft",
+        "running",
+        {"manifest_id": manifest.id},
+    )
+    sync_material_plan(run, run_steps)
+    await session.commit()
     try:
         generated = await provider.generate_material(generation_input)
     except Exception as exc:
+        set_material_step(
+            run_steps,
+            "generate_or_edit_draft",
+            "failed",
+            {"error": str(exc)[:300]},
+        )
+        run.status = "failed"
+        run.stop_reason = "generation_error"
+        for step_type in (
+            "validate_draft",
+            "independent_verify_draft",
+            "present_candidate_version",
+            "adopt_version",
+        ):
+            set_material_step(
+                run_steps, step_type, "blocked", {"reason": "generation_error"}
+            )
+        sync_material_plan(run, run_steps)
+        await session.commit()
         raise HTTPException(502, f"大模型生成失败：{str(exc)[:300]}") from exc
     response_type = str(generated.get("response_type", "chat"))
+    set_material_step(
+        run_steps,
+        "generate_or_edit_draft",
+        "accepted",
+        {"response_type": response_type},
+    )
     context_sources = [
         *[{"type": "document", "id": item.id, "label": item.filename} for item in reference_documents],
         *[{"type": "reference_draft", "id": item.id, "label": item.title} for item in reference_drafts],
@@ -1760,6 +2114,7 @@ async def _generate_writing_reply(
         }] if official_context else []),
         {"type": "conversation_history", "message_count": len(history)},
         {"type": "memory", "count": len(memories_by_key)},
+        {"type": "context_manifest", "id": manifest.id},
         *([{"type": "current_draft", "id": current_draft.id, "version": current_draft.version_number}] if current_draft else []),
     ]
     if response_type == "chat":
@@ -1773,14 +2128,79 @@ async def _generate_writing_reply(
             content=message_content,
             sources=[{"type": "response_mode", "value": "chat"}, *context_sources],
         ))
+        for step_type in (
+            "validate_draft",
+            "independent_verify_draft",
+            "present_candidate_version",
+            "adopt_version",
+        ):
+            set_material_step(run_steps, step_type, "skipped", {"reason": "chat_response"})
+        manifest.status = "consumed" if completeness["verdict"] == "accepted" else "partial"
+        run.status = "completed"
+        run.stop_reason = "success"
+        run.final_output = message_content
+        run.structured_output = {
+            "response_type": "chat",
+            "context_manifest_id": manifest.id,
+        }
+        sync_material_plan(run, run_steps)
         conversation.updated_at = datetime.now(timezone.utc)
         await session.commit()
         await session.refresh(conversation)
         return await serialize_writing_conversation(session, conversation)
     if response_type != "draft":
+        for step_type in (
+            "validate_draft",
+            "independent_verify_draft",
+            "present_candidate_version",
+            "adopt_version",
+        ):
+            set_material_step(
+                run_steps, step_type, "blocked", {"reason": "invalid_response_type"}
+            )
+        run.status = "failed"
+        run.stop_reason = "invalid_response_type"
+        sync_material_plan(run, run_steps)
+        await session.commit()
         raise HTTPException(422, "模型返回了无法识别的材料响应类型")
+    if goal_spec["intent"] not in {"generate", "edit"}:
+        for step_type in (
+            "validate_draft",
+            "independent_verify_draft",
+            "present_candidate_version",
+            "adopt_version",
+        ):
+            set_material_step(
+                run_steps, step_type, "blocked", {"reason": "write_intent_not_confirmed"}
+            )
+        run.status = "failed"
+        run.stop_reason = "write_intent_not_confirmed"
+        sync_material_plan(run, run_steps)
+        await session.commit()
+        raise HTTPException(422, "本轮未识别到明确的生成或修改意图，未创建文稿版本")
     content = str(generated.get("content", "")).strip()
     if not content or verify_output(content):
+        set_material_step(
+            run_steps,
+            "validate_draft",
+            "rejected",
+            {"reason": "content_integrity_failed"},
+        )
+        run.status = "failed"
+        run.stop_reason = "draft_validation_failed"
+        for step_type in (
+            "independent_verify_draft",
+            "present_candidate_version",
+            "adopt_version",
+        ):
+            set_material_step(
+                run_steps,
+                step_type,
+                "blocked",
+                {"reason": "draft_validation_failed"},
+            )
+        sync_material_plan(run, run_steps)
+        await session.commit()
         raise HTTPException(422, "生成内容未通过完整性或安全检查")
     base_draft = next((
         item for item in conversation_drafts
@@ -1795,6 +2215,205 @@ async def _generate_writing_reply(
         item for item in reference_drafts
         if item.program_id and item.program_id != program.id
     ), None)
+    if base_draft and content == base_draft.content:
+        set_material_step(
+            run_steps,
+            "validate_draft",
+            "rejected",
+            {"reason": "content_unchanged", "base_draft_id": base_draft.id},
+        )
+        set_material_step(
+            run_steps,
+            "independent_verify_draft",
+            "skipped",
+            {"reason": "content_unchanged"},
+        )
+        set_material_step(
+            run_steps,
+            "present_candidate_version",
+            "skipped",
+            {"reason": "content_unchanged"},
+        )
+        set_material_step(
+            run_steps,
+            "adopt_version",
+            "skipped",
+            {"reason": "no_candidate_version"},
+        )
+        manifest.status = "consumed"
+        run.status = "completed"
+        run.stop_reason = "no_change"
+        run.final_output = "正文没有变化，未创建重复版本。"
+        run.structured_output = {
+            "response_type": "chat",
+            "context_manifest_id": manifest.id,
+            "reason": "content_unchanged",
+        }
+        sync_material_plan(run, run_steps)
+        session.add(
+            Message(
+                owner_id=settings.local_owner_id,
+                conversation_id=conversation.id,
+                role="assistant",
+                content="正文没有发生变化，因此没有创建重复版本。",
+                sources=[
+                    {"type": "response_mode", "value": "chat"},
+                    *context_sources,
+                ],
+            )
+        )
+        await session.commit()
+        await session.refresh(conversation)
+        return await serialize_writing_conversation(session, conversation)
+    allowed_source_ids = {item.id for item in confirmed}
+    generated_source_ids = [
+        value
+        for value in generated.get("source_experience_ids", [])
+        if value in allowed_source_ids
+    ]
+    set_material_step(
+        run_steps,
+        "validate_draft",
+        "accepted",
+        {
+            "manifest_id": manifest.id,
+            "base_draft_id": base_draft.id if base_draft else None,
+            "source_experience_ids": generated_source_ids,
+        },
+    )
+    verification_attempts = []
+    verification_report = {}
+    for attempt in range(2):
+        set_material_step(
+            run_steps,
+            "independent_verify_draft",
+            "running",
+            {"attempt": attempt + 1, "manifest_id": manifest.id},
+        )
+        sync_material_plan(run, run_steps)
+        await session.commit()
+        try:
+            semantic_report = await provider.verify_material(generation_input, generated)
+        except Exception as exc:
+            set_material_step(
+                run_steps,
+                "independent_verify_draft",
+                "failed",
+                {"error": str(exc)[:300], "attempt": attempt + 1},
+            )
+            run.status = "failed"
+            run.stop_reason = "verification_error"
+            manifest.status = "rejected"
+            for step_type in ("present_candidate_version", "adopt_version"):
+                set_material_step(
+                    run_steps,
+                    step_type,
+                    "blocked",
+                    {"reason": "verification_error"},
+                )
+            sync_material_plan(run, run_steps)
+            await session.commit()
+            raise HTTPException(502, f"独立验证器执行失败：{str(exc)[:300]}") from exc
+        verification_report = verify_material_candidate(
+            generation_input, generated, semantic_report
+        )
+        verification_attempts.append(verification_report)
+        if verification_report.get("verdict") == "accepted":
+            break
+        if attempt == 0 and verification_report.get("verdict") == "revise":
+            retry_input = {
+                **generation_input,
+                "prompt": payload.message,
+                "verification_feedback": verification_report,
+                "revision_instruction": (
+                    "根据独立验证报告修订候选文稿；不得引入新的事实或来源。"
+                ),
+            }
+            try:
+                generated = await provider.generate_material(retry_input)
+            except Exception as exc:
+                set_material_step(
+                    run_steps,
+                    "independent_verify_draft",
+                    "failed",
+                    {"error": str(exc)[:300], "attempt": attempt + 1},
+                )
+                run.status = "failed"
+                run.stop_reason = "verification_revision_error"
+                manifest.status = "rejected"
+                for step_type in ("present_candidate_version", "adopt_version"):
+                    set_material_step(
+                        run_steps,
+                        step_type,
+                        "blocked",
+                        {"reason": "verification_revision_error"},
+                    )
+                sync_material_plan(run, run_steps)
+                await session.commit()
+                raise HTTPException(502, f"验证后自动修订失败：{str(exc)[:300]}") from exc
+            if str(generated.get("response_type") or "") != "draft":
+                verification_report = {
+                    "verdict": "rejected",
+                    "issues": ["revision_did_not_return_draft"],
+                }
+                break
+            content = str(generated.get("content") or "").strip()
+            if not content or verify_output(content) or (
+                base_draft and content == base_draft.content
+            ):
+                verification_report = {
+                    "verdict": "rejected",
+                    "issues": ["revision_content_invalid_or_unchanged"],
+                }
+                break
+            generated_source_ids = [
+                value
+                for value in generated.get("source_experience_ids", [])
+                if value in allowed_source_ids
+            ]
+            generation_input = retry_input
+            continue
+        break
+    if verification_report.get("verdict") != "accepted":
+        set_material_step(
+            run_steps,
+            "independent_verify_draft",
+            "rejected",
+            {
+                "verification_report": verification_report,
+                "attempts": verification_attempts,
+            },
+        )
+        for step_type in ("present_candidate_version", "adopt_version"):
+            set_material_step(
+                run_steps,
+                step_type,
+                "blocked",
+                {"reason": "independent_verification_failed"},
+            )
+        manifest.status = "rejected"
+        run.status = "failed"
+        run.stop_reason = "independent_verification_failed"
+        run.final_output = "候选文稿未通过独立验证，未创建新版本。"
+        run.structured_output = {
+            "response_type": "verification_report",
+            "context_manifest_id": manifest.id,
+            "verification": verification_report,
+            "attempts": verification_attempts,
+        }
+        sync_material_plan(run, run_steps)
+        await session.commit()
+        issues = ", ".join(verification_report.get("issues") or [])
+        raise HTTPException(422, f"候选文稿未通过独立验证：{issues or '需要修订'}")
+    set_material_step(
+        run_steps,
+        "independent_verify_draft",
+        "accepted",
+        {
+            "verification_report": verification_report,
+            "attempt_count": len(verification_attempts),
+        },
+    )
     root_id = (base_draft.root_id or base_draft.id) if base_draft else None
     latest_version = await session.scalar(select(func.max(MaterialDraft.version_number)).where(
         MaterialDraft.owner_id == settings.local_owner_id,
@@ -1822,9 +2441,29 @@ async def _generate_writing_reply(
         language="English",
         prompt=payload.message,
         content=content,
-        source_experience_ids=[item.id for item in confirmed],
+        source_experience_ids=generated_source_ids,
         warnings=list(generated.get("warnings", [])),
-        model_info={**dict(generated.get("model_info", {})), "conversation_id": conversation.id},
+        model_info={
+            **dict(generated.get("model_info", {})),
+            "conversation_id": conversation.id,
+            "agent_run_id": run.id,
+            "context_manifest_id": manifest.id,
+            "verification": verification_report,
+        },
+        context_manifest_id=manifest.id,
+        source_refs={
+            "experience_ids": generated_source_ids,
+            "loaded_experience_ids": [item.id for item in confirmed],
+            "document_ids": [item.id for item in reference_documents],
+            "reference_draft_ids": [item.id for item in reference_drafts],
+            "official_evidence_ids": [
+                item.get("evidence_id")
+                for item in official_context.get("evidence", [])
+                if item.get("evidence_id")
+            ],
+            "current_draft_id": current_draft.id if current_draft else None,
+            "conversation_id": conversation.id,
+        },
         status="draft",
     )
     session.add(draft)
@@ -1843,6 +2482,30 @@ async def _generate_writing_reply(
         ],
     )
     session.add(assistant_message)
+    set_material_step(
+        run_steps,
+        "present_candidate_version",
+        "accepted",
+        {"draft_id": draft.id, "version": version, "root_id": draft.root_id},
+    )
+    set_material_step(
+        run_steps,
+        "adopt_version",
+        "pending",
+        {"requires_user_confirmation": True, "draft_id": draft.id},
+    )
+    manifest.status = "consumed"
+    run.status = "completed"
+    run.stop_reason = "candidate_ready"
+    run.final_output = str(generated.get("message") or "已生成候选文稿版本。")
+    run.structured_output = {
+        "response_type": "draft",
+        "draft_id": draft.id,
+        "context_manifest_id": manifest.id,
+        "verification": verification_report,
+        "requires_user_confirmation": True,
+    }
+    sync_material_plan(run, run_steps)
     conversation.updated_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(conversation)
@@ -1893,8 +2556,10 @@ async def create_application(
         ApplicationPackage.owner_id == settings.local_owner_id,
         ApplicationPackage.program_id == payload.program_id,
     ))
+    if package:
+        await refresh_application_package(session, package)
     if not package or not package.ready:
-        raise HTTPException(400, "该项目申请包尚未就绪，请先核验官网并完成全部必需材料")
+        raise HTTPException(400, "该项目申请包尚未就绪，请先完成并确认全部必需材料")
     existing = await session.scalar(
         select(Application).where(
             Application.owner_id == settings.local_owner_id,
@@ -1986,28 +2651,57 @@ async def chat_stream(
 ) -> StreamingResponse:
     async def stream():
         queue: asyncio.Queue = asyncio.Queue()
+        task: asyncio.Task
 
         async def emit(event: str, data: Dict[str, Any]) -> None:
+            if event == "run.started" and data.get("conversation_id"):
+                active_chat_tasks[str(data["conversation_id"])] = task
             await queue.put((event, data))
 
         async def execute() -> None:
             try:
                 await harness.run(session, payload.message, payload.conversation_id, emit)
+            except asyncio.CancelledError:
+                pass
             except Exception as exc:
                 await queue.put(("run.failed", {"error": str(exc)}))
             finally:
+                for conversation_id, active_task in list(active_chat_tasks.items()):
+                    if active_task is task:
+                        active_chat_tasks.pop(conversation_id, None)
                 await queue.put(None)
 
         task = asyncio.create_task(execute())
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            event, data = item
-            yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
-        await task
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                event, data = item
+                yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@router.post("/chat/{conversation_id}/cancel")
+async def cancel_chat_generation(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> Dict[str, bool]:
+    conversation = await session.get(Conversation, conversation_id)
+    if not conversation or conversation.owner_id != settings.local_owner_id:
+        raise HTTPException(404, "对话不存在")
+    task = active_chat_tasks.get(conversation_id)
+    if not task or task.done():
+        return {"cancelled": False}
+    task.cancel()
+    return {"cancelled": True}
 
 
 @router.get("/agent-runs/{run_id}", response_model=AgentRunResponse)
@@ -2056,6 +2750,7 @@ async def get_agent_trace(
         tool_calls=[
             {
                 "id": call.id,
+                "step_id": call.step_id,
                 "tool_name": call.tool_name,
                 "status": call.status,
                 "arguments": call.arguments,

@@ -57,6 +57,24 @@ class ProfileResponse(ProfileUpdate):
     experiences: List[ExperienceResponse] = Field(default_factory=list)
 
 
+class RecommendationGoalUpdate(BaseModel):
+    target_countries: List[str] = Field(default_factory=list, max_length=12)
+    target_fields: List[str] = Field(default_factory=list, max_length=20)
+    target_university: str = Field("", max_length=200)
+    target_degree_level: str = Field("master", pattern="^(undergraduate|master|doctoral)$")
+    intake: str = Field("", max_length=80)
+    budget: Optional[float] = Field(None, ge=0)
+    max_qs_rank: Optional[int] = Field(100, ge=1, le=1500)
+
+
+class RecommendationGoalResponse(RecommendationGoalUpdate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    owner_id: str
+    updated_at: datetime
+
+
 class DocumentResponse(ORMModel):
     id: str
     filename: str
@@ -113,11 +131,22 @@ class ProgramResponse(ORMModel):
     duration_months: Optional[int]
     tuition: Optional[float]
     currency: str
+    qs_rank: Optional[int] = None
+    qs_ranking_year: Optional[int] = None
     official_url: str
+    catalog_url: str = ""
+    faculty_catalog_url: str = ""
     summary: str
     requirement: Optional[RequirementResponse] = None
     sources: List[SourceResponse] = Field(default_factory=list)
     evidence: List[EvidenceResponse] = Field(default_factory=list)
+
+
+class UniversityOptionResponse(BaseModel):
+    university: str
+    country: str
+    city: str = ""
+    qs_rank: int
 
 
 class ProgramVerifyResponse(BaseModel):
@@ -142,6 +171,8 @@ class ProgramRecommendationResponse(BaseModel):
     program: ProgramResponse
     score: float
     reasons: List[str] = Field(default_factory=list)
+    verification_status: str = "needs_review"
+    verification_error: str = ""
 
 
 class ShortlistCreate(BaseModel):
@@ -265,9 +296,32 @@ class MaterialDraftResponse(ORMModel):
     source_experience_ids: List[str]
     warnings: List[str]
     model_info: Dict[str, Any]
+    context_manifest_id: Optional[str]
+    source_refs: Dict[str, Any]
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class ContextManifestResponse(ORMModel):
+    id: str
+    agent_run_id: Optional[str]
+    conversation_id: Optional[str]
+    program_id: Optional[str]
+    material_kind: str
+    slot_key: str
+    intent: str
+    profile_ref: Dict[str, Any]
+    conversation_ref: Dict[str, Any]
+    experience_refs: List[Dict[str, Any]]
+    document_refs: List[Dict[str, Any]]
+    draft_refs: List[Dict[str, Any]]
+    official_evidence_refs: List[Dict[str, Any]]
+    current_draft_ref: Dict[str, Any]
+    content_hashes: Dict[str, Any]
+    completeness: Dict[str, Any]
+    status: str
+    created_at: datetime
 
 
 class PackageMaterialUpdate(BaseModel):
@@ -405,6 +459,7 @@ class WritingConversationResponse(ORMModel):
     slot_key: str
     material_kind: str
     resource_ids: List[str]
+    memory_state: Dict[str, Any] = Field(default_factory=dict)
     messages: List[WritingMessageResponse] = Field(default_factory=list)
     latest_draft: Optional[MaterialDraftResponse] = None
     created_at: datetime
@@ -421,6 +476,7 @@ class AssistantConversationResponse(BaseModel):
     material_kind: str = ""
     pinned: bool = False
     resource_ids: List[str] = Field(default_factory=list)
+    memory_state: Dict[str, Any] = Field(default_factory=dict)
     messages: List[WritingMessageResponse] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime

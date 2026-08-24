@@ -1,5 +1,5 @@
-from datetime import date, timedelta
 import re
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy import delete, or_, select
@@ -10,17 +10,20 @@ from app.models.entities import (
     ApplicantProfile,
     ApplicationPackage,
     Document,
+    EvidenceChunk,
     Experience,
     MaterialArtifact,
     MaterialDraft,
     MaterialPlan,
     Program,
     ProgramRequirement,
+    RecommendationGoal,
     Shortlist,
     ShortlistItem,
     Task,
 )
-from app.schemas.api import ProfileUpdate, TaskCreate
+from app.schemas.api import ProfileUpdate, RecommendationGoalUpdate, TaskCreate
+from app.services.rankings import ranked_university_options, same_university
 
 DEFAULT_MATERIALS = ["CV", "PS", "成绩单", "推荐信", "语言成绩"]
 
@@ -29,7 +32,7 @@ MATERIAL_ALIASES = {
     "ps": ("PS", "Statement of Purpose", "Personal Statement", "Essay", "个人陈述", "文书"),
     "transcript": ("Transcript", "成绩单"),
     "recommendation": ("Recommendation", "Reference", "推荐信"),
-    "language": ("TOEFL", "IELTS", "Language", "语言成绩"),
+    "language": ("TOEFL", "IELTS", "Language", "English proficiency", "语言成绩"),
     "writing_sample": ("Writing Sample", "写作样本"),
     "portfolio": ("Portfolio", "作品集"),
     "video_essay": ("Video Essay", "视频文书"),
@@ -42,6 +45,20 @@ def material_key(name: str) -> str:
         if any(alias.lower() in lowered for alias in aliases):
             return key
     return "other_" + "_".join(name.lower().split())[:60]
+
+
+def material_requirements_with_defaults(names: List[str]) -> List[str]:
+    """Keep official requirements and fill missing baseline application categories."""
+    official = [str(value).strip() for value in names if str(value).strip()]
+    existing_categories = {material_key(value) for value in official}
+    return [
+        *official,
+        *(
+            value
+            for value in DEFAULT_MATERIALS
+            if material_key(value) not in existing_categories
+        ),
+    ]
 
 
 def material_slots(names: List[str]) -> List[Dict[str, Any]]:
@@ -85,7 +102,7 @@ def material_slots(names: List[str]) -> List[Dict[str, Any]]:
             }.items() if re.search(rf"\b{word}\b", name, re.IGNORECASE) or word in name), None)
             match = int(number.group(1)) if number else word_number
             count = min(5, max(1, match or 1))
-        for index in range(count):
+        for _index in range(count):
             counters[base_key] = counters.get(base_key, 0) + 1
             position = counters[base_key]
             slot_key = base_key if base_key not in {"ps", "recommendation"} and position == 1 else f"{base_key}-{position}"
@@ -115,12 +132,40 @@ def material_label(key: str, original: str = "") -> str:
     return labels.get(key, original or key)
 
 FIELD_ALIASES = {
-    "computer science": {"computer science", "computer engineering", "software engineering", "计算机", "软件工程", "人工智能", "ai"},
+    "computer science": {
+        "computer science", "computer engineering", "software engineering",
+        "artificial intelligence", "data science", "cyber security", "cybersecurity",
+        "计算机", "软件工程", "人工智能", "数据科学", "网络安全", "ai",
+    },
     "business": {"business", "management", "商科", "管理"},
     "business analytics": {"business analytics", "商业分析"},
     "finance": {"finance", "financial engineering", "金融", "金融工程"},
     "accounting": {"accounting", "会计"},
     "public policy": {"public policy", "public administration", "公共政策", "公共管理"},
+}
+
+COUNTRY_ALIASES = {
+    "United States": {"united states", "united states of america", "usa", "us", "美国", "美國"},
+    "United Kingdom": {"united kingdom", "uk", "great britain", "britain", "英国", "英國"},
+    "Canada": {"canada", "加拿大"},
+    "Australia": {"australia", "澳大利亚", "澳洲", "澳大利亞"},
+    "Singapore": {"singapore", "新加坡"},
+    "Hong Kong": {
+        "hong kong",
+        "hong kong sar",
+        "hong kong s.a.r.",
+        "hong kong sar china",
+        "hong kong s.a.r. china",
+        "hong kong special administrative region",
+        "hong kong special administrative region of china",
+        "香港",
+        "中国香港",
+        "中國香港",
+        "中国香港特别行政区",
+        "中國香港特別行政區",
+    },
+    "New Zealand": {"new zealand", "nz", "新西兰", "紐西蘭", "新西蘭"},
+    "Ireland": {"ireland", "爱尔兰", "愛爾蘭"},
 }
 
 
@@ -141,14 +186,45 @@ def canonical_fields(values: List[str]) -> List[str]:
     return matches
 
 
+def canonical_countries(values: List[str]) -> List[str]:
+    countries = []
+    for value in values:
+        cleaned = value.strip()
+        lowered = re.sub(r"[\s,.\-]+", " ", cleaned.casefold()).strip()
+        canonical = next(
+            (
+                country
+                for country, aliases in COUNTRY_ALIASES.items()
+                if lowered
+                in {
+                    re.sub(r"[\s,.\-]+", " ", candidate.casefold()).strip()
+                    for candidate in (country, *aliases)
+                }
+            ),
+            cleaned,
+        )
+        if canonical:
+            countries.append(canonical)
+    return list(dict.fromkeys(countries))
+
+
 def program_matches_fields(program: Program, values: List[str]) -> bool:
-    requested = canonical_fields(values)
-    if not requested:
-        return True
-    if "business" in requested and program.field in {"Business Analytics", "Finance", "Accounting"}:
-        return True
     program_fields = set(canonical_fields([program.field]))
-    return bool(set(requested) & program_fields)
+    searchable = f"{program.field} {program.name}".casefold()
+    for value in values:
+        requested = canonical_fields([value])
+        if requested:
+            if "business" in requested and program.field in {
+                "Business Analytics", "Finance", "Accounting"
+            }:
+                return True
+            if set(requested) & program_fields:
+                return True
+            continue
+        cleaned = re.sub(r"\s+", " ", value.strip()).casefold()
+        if cleaned and (cleaned in searchable or program.field.casefold() in cleaned):
+            return True
+    return False
 
 
 async def get_or_create_profile(session: AsyncSession) -> ApplicantProfile:
@@ -175,6 +251,56 @@ async def profile_with_experiences(session: AsyncSession) -> tuple:
         ).all()
     )
     return profile, experiences
+
+
+async def get_or_create_recommendation_goal(session: AsyncSession) -> RecommendationGoal:
+    goal = await session.scalar(
+        select(RecommendationGoal).where(
+            RecommendationGoal.owner_id == settings.local_owner_id
+        )
+    )
+    if goal is None:
+        profile = await get_or_create_profile(session)
+        goal = RecommendationGoal(
+            owner_id=settings.local_owner_id,
+            target_countries=canonical_countries(profile.target_countries),
+            target_fields=list(profile.target_fields),
+            target_university="",
+            target_degree_level="master",
+            intake=profile.intake,
+            budget=profile.budget,
+            max_qs_rank=100,
+        )
+        session.add(goal)
+        await session.commit()
+        await session.refresh(goal)
+    return goal
+
+
+async def update_recommendation_goal(
+    session: AsyncSession, payload: RecommendationGoalUpdate
+) -> RecommendationGoal:
+    goal = await get_or_create_recommendation_goal(session)
+    goal.target_countries = canonical_countries(payload.target_countries)
+    goal.target_fields = list(
+        dict.fromkeys(value.strip() for value in payload.target_fields if value.strip())
+    )
+    goal.target_university = payload.target_university.strip()
+    goal.target_degree_level = payload.target_degree_level
+    goal.intake = payload.intake.strip()
+    goal.budget = payload.budget
+    goal.max_qs_rank = payload.max_qs_rank
+
+    # Keep legacy profile fields synchronized until all Agent contexts read the
+    # dedicated recommendation goal directly.
+    profile = await get_or_create_profile(session)
+    profile.target_countries = goal.target_countries
+    profile.target_fields = goal.target_fields
+    profile.intake = goal.intake
+    profile.budget = goal.budget
+    await session.commit()
+    await session.refresh(goal)
+    return goal
 
 
 async def update_profile(session: AsyncSession, payload: ProfileUpdate) -> tuple:
@@ -227,6 +353,7 @@ async def search_programs_for_profile(
     use_profile: bool = True,
 ) -> List[Program]:
     profile = await get_or_create_profile(session)
+    goal = await get_or_create_recommendation_goal(session) if use_profile and not query else None
     if (
         use_profile
         and not query
@@ -234,27 +361,63 @@ async def search_programs_for_profile(
         and not country
         and (
             not profile.confirmed
-            or not profile.target_fields
-            or not profile.target_countries
+            or not goal
+            or not goal.target_fields
+            or (not goal.target_countries and not goal.target_university)
         )
     ):
         return []
     query_fields = canonical_fields([query]) if query else []
     requested_fields = [field] if field else (query_fields or (
-        (profile.target_fields or ([profile.current_major] if profile.current_major else []))
-        if use_profile and not query else []
+        (goal.target_fields or ([profile.current_major] if profile.current_major else []))
+        if use_profile else []
     ))
-    requested_countries = [country] if country else (profile.target_countries if use_profile and not query else [])
+    requested_countries = canonical_countries(
+        [country] if country else (goal.target_countries if goal else [])
+    )
     # “master computer science” 这类自然语言不是项目名，先识别专业语义再筛选；
     # 没识别出专业时才按学校、项目名和字段做普通关键词搜索。
     items = await search_programs(
         session, query="" if query_fields else query, country="", field=""
     )
-    if requested_countries:
+    if goal and goal.target_university:
+        items = [
+            item for item in items
+            if same_university(item.university, goal.target_university)
+        ]
+    elif requested_countries:
         items = [item for item in items if item.country in requested_countries]
     if requested_fields:
         items = [item for item in items if program_matches_fields(item, requested_fields)]
+    if goal and goal.max_qs_rank is not None:
+        items = [
+            item
+            for item in items
+            if item.qs_rank is not None and item.qs_rank <= goal.max_qs_rank
+        ]
+    if query and query_fields:
+        lowered_query = query.lower()
+        named_matches = [
+            item
+            for item in items
+            if item.university.lower() in lowered_query
+            or item.name.lower() in lowered_query
+        ]
+        if named_matches:
+            items = named_matches
     return items
+
+
+async def university_options(
+    session: AsyncSession,
+    countries: Optional[List[str]] = None,
+    max_qs_rank: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    del session  # Ranking options are deterministic and do not depend on cached programs.
+    return ranked_university_options(
+        canonical_countries(countries or []),
+        max_qs_rank,
+    )
 
 
 async def get_program(session: AsyncSession, program_id: str) -> Optional[Program]:
@@ -268,22 +431,30 @@ async def get_requirement(session: AsyncSession, program_id: str) -> Optional[Pr
 
 
 async def score_program(
-    profile: ApplicantProfile, program: Program, requirement: Optional[ProgramRequirement]
+    profile: ApplicantProfile,
+    program: Program,
+    requirement: Optional[ProgramRequirement],
+    goal: Optional[RecommendationGoal] = None,
 ) -> tuple:
     score = 68.0
     reasons = []
     risks = []
-    if profile.target_countries and program.country in profile.target_countries:
+    target_countries = goal.target_countries if goal else profile.target_countries
+    target_fields = goal.target_fields if goal else profile.target_fields
+    budget = goal.budget if goal else profile.budget
+    if goal and goal.target_university and same_university(
+        program.university, goal.target_university
+    ):
+        score += 8
+        reasons.append("指定学校匹配")
+    elif target_countries and program.country in canonical_countries(target_countries):
         score += 8
         reasons.append("符合目标国家")
-    if profile.target_fields and any(
-        target.lower() in program.field.lower() or program.field.lower() in target.lower()
-        for target in profile.target_fields
-    ):
+    if target_fields and program_matches_fields(program, target_fields):
         score += 10
         reasons.append("专业方向匹配")
-    if profile.budget and program.tuition:
-        if program.tuition <= profile.budget:
+    if budget and program.tuition:
+        if program.tuition <= budget:
             score += 5
             reasons.append("学费在预算范围内")
         else:
@@ -310,27 +481,34 @@ async def score_recommendation(
     experiences: List[Experience],
     program: Program,
     requirement: Optional[ProgramRequirement],
+    goal: Optional[RecommendationGoal] = None,
 ) -> tuple[float, List[str]]:
     """Rank candidates using every confirmed profile signal that the catalog can compare."""
     score = 45.0
     reasons: List[str] = []
 
-    if profile.target_countries and program.country in profile.target_countries:
+    target_countries = goal.target_countries if goal else profile.target_countries
+    target_fields = goal.target_fields if goal else profile.target_fields
+    budget = goal.budget if goal else profile.budget
+    intake = goal.intake if goal else profile.intake
+    if goal and goal.target_university and same_university(
+        program.university, goal.target_university
+    ):
+        score += 12
+        reasons.append("指定学校匹配")
+    elif target_countries and program.country in canonical_countries(target_countries):
         score += 12
         reasons.append("符合目标国家")
-    if profile.target_fields and any(
-        target.lower() in program.field.lower() or program.field.lower() in target.lower()
-        for target in profile.target_fields
-    ):
+    if target_fields and program_matches_fields(program, target_fields):
         score += 18
         reasons.append("专业方向匹配")
 
-    if profile.budget and program.tuition:
-        if program.tuition <= profile.budget:
+    if budget and program.tuition:
+        if program.tuition <= budget:
             score += 6
             reasons.append("学费在预算范围内")
         else:
-            score -= min(15, 5 + (program.tuition - profile.budget) / profile.budget * 10)
+            score -= min(15, 5 + (program.tuition - budget) / budget * 10)
 
     if requirement and requirement.min_gpa is not None and profile.gpa is not None:
         if profile.gpa >= requirement.min_gpa:
@@ -378,8 +556,8 @@ async def score_recommendation(
         score += 3
         reasons.append("城市偏好匹配")
 
-    if profile.intake:
-        reasons.append(f"面向 {profile.intake} 申请规划")
+    if intake:
+        reasons.append(f"面向 {intake} 申请规划")
 
     return max(0, min(100, score)), list(dict.fromkeys(reasons))
 
@@ -391,7 +569,10 @@ async def recommendation_candidates(
     excluded_program_ids: Optional[Set[str]] = None,
 ) -> List[tuple[Program, float, List[str]]]:
     profile, experiences = await profile_with_experiences(session)
-    programs = await search_programs_for_profile(session, query=query, use_profile=not bool(query))
+    goal = await get_or_create_recommendation_goal(session)
+    programs = await search_programs_for_profile(
+        session, query=query, use_profile=not bool(query)
+    )
     excluded_program_ids = excluded_program_ids or set()
     programs = [
         program for program in programs if program.id not in excluded_program_ids
@@ -400,7 +581,7 @@ async def recommendation_candidates(
     for program in programs:
         requirement = await get_requirement(session, program.id)
         score, reasons = await score_recommendation(
-            profile, experiences, program, requirement
+            profile, experiences, program, requirement, goal
         )
         ranked.append((program, score, reasons))
     ranked.sort(key=lambda item: (-item[1], item[0].university, item[0].name))
@@ -409,6 +590,7 @@ async def recommendation_candidates(
 
 async def create_shortlist(session: AsyncSession, name: str, program_ids: List[str]) -> Shortlist:
     profile = await get_or_create_profile(session)
+    goal = await get_or_create_recommendation_goal(session)
     shortlist = Shortlist(name=name, owner_id=settings.local_owner_id)
     session.add(shortlist)
     await session.flush()
@@ -418,7 +600,7 @@ async def create_shortlist(session: AsyncSession, name: str, program_ids: List[s
         if not program:
             continue
         requirement = await get_requirement(session, program_id)
-        score, tier, reasons, risks = await score_program(profile, program, requirement)
+        score, tier, reasons, risks = await score_program(profile, program, requirement, goal)
         rationale = "；".join(reasons)
         rationales.append(f"{program.university}：{rationale}")
         session.add(
@@ -458,6 +640,7 @@ async def add_shortlist_programs(
         ).all()
     )
     profile, experiences = await profile_with_experiences(session)
+    goal = await get_or_create_recommendation_goal(session)
     for program_id in dict.fromkeys(program_ids):
         if program_id in existing_ids:
             continue
@@ -466,9 +649,9 @@ async def add_shortlist_programs(
             continue
         requirement = await get_requirement(session, program_id)
         score, reasons = await score_recommendation(
-            profile, experiences, program, requirement
+            profile, experiences, program, requirement, goal
         )
-        _, tier, _, risks = await score_program(profile, program, requirement)
+        _, tier, _, risks = await score_program(profile, program, requirement, goal)
         session.add(
             ShortlistItem(
                 shortlist_id=shortlist.id,
@@ -600,7 +783,14 @@ async def _initial_assets(session: AsyncSession, program_id: str) -> dict:
         if artifact.kind in by_key and (
             artifact.scope == "general" or artifact.program_id == program_id
         ):
-            by_key[artifact.kind].append({"type": "artifact", "id": artifact.id, "label": artifact.version_name})
+            by_key[artifact.kind].append({
+                "type": "artifact",
+                "id": artifact.id,
+                "label": artifact.version_name,
+                "program_id": artifact.program_id,
+                "scope": artifact.scope,
+                "status": artifact.status,
+            })
     for draft in drafts:
         if draft.kind in by_key:
             scope = "general" if draft.program_id is None else (
@@ -624,8 +814,22 @@ async def refresh_application_package(
     session: AsyncSession, package: ApplicationPackage
 ) -> ApplicationPackage:
     requirement = await get_requirement(session, package.program_id)
-    official_verified = bool(requirement and requirement.verified)
-    names = list(requirement.materials) if requirement and requirement.materials else DEFAULT_MATERIALS
+    material_evidence_id = await session.scalar(
+        select(EvidenceChunk.id).where(
+            EvidenceChunk.program_id == package.program_id,
+            EvidenceChunk.field == "materials",
+        ).limit(1)
+    )
+    official_verified = bool(
+        material_evidence_id and requirement and requirement.materials
+    )
+    official_names = (
+        list(requirement.materials)
+        if official_verified and requirement and requirement.materials
+        else []
+    )
+    official_categories = {material_key(str(name)) for name in official_names}
+    names = material_requirements_with_defaults(official_names)
     unique = material_slots([str(name) for name in names])
     assets = await _initial_assets(session, package.program_id)
     previous = {item.get("material_key"): item for item in (package.checklist or [])}
@@ -640,10 +844,17 @@ async def refresh_application_package(
         status = old.get("status")
         selected_type = old.get("selected_asset_type", "")
         selected_id = old.get("selected_asset_id", "")
-        selected_exists = any(
-            candidate.get("type") == selected_type and candidate.get("id") == selected_id
+        selected_candidate = next((
+            candidate
             for candidate in candidates
-        )
+            if candidate.get("type") == selected_type
+            and candidate.get("id") == selected_id
+        ), None)
+        selected_exists = selected_candidate is not None
+        if selected_candidate and selected_candidate.get("type") == "draft":
+            selected_exists = selected_candidate.get("status") == "reviewed"
+        if selected_candidate and selected_candidate.get("type") == "artifact":
+            selected_exists = selected_candidate.get("status") in {"ready", "submitted"}
         if selected_id and not selected_exists:
             selected_type = ""
             selected_id = ""
@@ -656,16 +867,25 @@ async def refresh_application_package(
                 if candidate.get("type") != "draft" or candidate.get("status") == "reviewed"
             ]
             if category == "recommendation":
-                available = [candidate for candidate in candidates if candidate.get("id") not in used_recommendation_assets]
+                available = [
+                    candidate
+                    for candidate in available
+                    if candidate.get("id") not in used_recommendation_assets
+                ]
             elif category == "ps":
                 # A generic uploaded PS is useful as reference, but must not be silently
                 # treated as a project-ready submission. Only project-scoped artifacts or
                 # reviewed generated drafts can become the automatic default.
                 available = [
                     candidate for candidate in available
-                    if candidate.get("type") == "artifact" or (
+                    if (
+                        candidate.get("type") == "artifact"
+                        and candidate.get("program_id") == package.program_id
+                        and candidate.get("status") in {"ready", "submitted"}
+                    ) or (
                         candidate.get("type") == "draft"
-                        and candidate.get("scope") in {"general", "current_program"}
+                        and candidate.get("scope") == "current_program"
+                        and candidate.get("status") == "reviewed"
                     )
                 ]
             recommended = available[0] if available else None
@@ -682,13 +902,15 @@ async def refresh_application_package(
             **base,
             "required": True,
             "status": status,
-            "source_verified": official_verified,
+            "source_verified": official_verified and category in official_categories,
             "candidate_assets": candidates,
             "selected_asset_type": selected_type,
             "selected_asset_id": selected_id,
             "note": old.get("note", ""),
         })
     gaps = []
+    if not checklist:
+        gaps.append("暂未获取到该项目的官网材料要求")
     for item in checklist:
         if item["status"] == "missing":
             gaps.append(f"缺少：{item['name']}")
@@ -697,11 +919,11 @@ async def refresh_application_package(
     package.official_verified = official_verified
     package.checklist = checklist
     package.gaps = gaps
-    if selection_changed:
-        package.plan_confirmed = False
     selections_complete = bool(checklist) and all(
         item["status"] == "ready" and item.get("selected_asset_id") for item in checklist
     )
+    if selection_changed or not selections_complete:
+        package.plan_confirmed = False
     package.ready = package.plan_confirmed and selections_complete
     package.status = "ready" if package.ready else "materials_in_progress"
     await session.flush()
@@ -733,15 +955,25 @@ async def create_material_plan(session: AsyncSession, program_id: str) -> Materi
         raise ValueError("项目不存在")
     requirement = await get_requirement(session, program_id)
     _, experiences = await profile_with_experiences(session)
-    materials = (
-        requirement.materials if requirement and requirement.materials else DEFAULT_MATERIALS
+    material_evidence_id = await session.scalar(
+        select(EvidenceChunk.id).where(
+            EvidenceChunk.program_id == program_id,
+            EvidenceChunk.field == "materials",
+        ).limit(1)
     )
+    materials = (
+        requirement.materials
+        if material_evidence_id and requirement and requirement.materials
+        else []
+    )
+    official_categories = {material_key(str(name)) for name in materials}
+    materials = material_requirements_with_defaults([str(name) for name in materials])
     checklist = [
         {
             "name": item,
             "required": True,
             "status": "todo",
-            "source_verified": bool(requirement and requirement.verified),
+            "source_verified": material_key(str(item)) in official_categories,
         }
         for item in materials
     ]
@@ -758,8 +990,8 @@ async def create_material_plan(session: AsyncSession, program_id: str) -> Materi
     gaps = []
     if not confirmed:
         gaps.append("经历库中没有已确认经历，请先补充科研、实习或项目经历")
-    if not requirement or not requirement.verified:
-        gaps.append("材料要求尚未完成官网核验")
+    if not materials:
+        gaps.append("暂未获取到该项目的官网材料要求")
     plan = MaterialPlan(
         owner_id=settings.local_owner_id,
         program_id=program_id,
@@ -802,11 +1034,13 @@ async def create_timeline(session: AsyncSession, program_id: str) -> List[Task]:
         ApplicationPackage.owner_id == settings.local_owner_id,
         ApplicationPackage.program_id == program_id,
     ))
+    if package:
+        await refresh_application_package(session, package)
     if not package or not package.ready:
         raise ValueError("项目申请包材料尚未就绪，不能进入申请执行")
     requirement = await get_requirement(session, program_id)
-    if not requirement or not requirement.verified:
-        raise ValueError("项目截止日期和材料要求尚未完成官网核验，不能生成正式时间线")
+    if not requirement or not requirement.deadline:
+        raise ValueError("项目截止日期尚无官网原文证据，不能生成正式时间线")
     deadline = parse_deadline(requirement.deadline)
     milestones = [
         ("核验项目要求", "research", 100, "high"),
